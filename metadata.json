@@ -1,0 +1,6 @@
+{
+  "name": "Scottish Squirrel Sightings Explorer",
+  "description": "A custom mapping tool for the Central Borders Red Squirrel Network to visualize squirrel sightings data from Saving Scotland's Red Squirrels / NBN Atlas.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
