@@ -81,16 +81,13 @@ async function fetchAllSightings(species: 'red' | 'grey' | 'marten', forceReset:
   console.log(`[Bulk Load] Starting sync for ${species} in Scotland (Year by Year)...`);
   
   const taxonFilter = species === "red" 
-    ? `(scientificName:"Sciurus vulgaris" OR taxonConceptID:NBNSYS0000005108 OR lsid:NHMSYS0000080188)`
-    : species === "grey"
-      ? `(scientificName:"Sciurus carolinensis" OR taxonConceptID:NBNSYS0000005107 OR lsid:NHMSYS0000080184)`
-      : `(scientificName:"Martes martes" OR taxonConceptID:NBNSYS0000005111 OR lsid:NHMSYS0000080190)`;
+    ? `taxonConceptID:NBNSYS0000005108`
+    : species === "grey" 
+      ? `taxonConceptID:NBNSYS0000005107`
+      : `taxonConceptID:NBNSYS0000005111`;
   
-  const ssrsUids = ['dr382', 'dr1711', 'dr1712', 'dr1713', 'dr2140', 'dr383', 'dr659'];
-  const uidFilter = `(dataResourceUid:(${ssrsUids.join(' OR ')}) OR dataResourceName:("Saving Scotland's Red Squirrels" OR "SSRS"))`;
-  
-  // For squirrels, we ONLY want SSRS data. For Martens, we want all occurrences.
-  const query = species === 'marten' ? taxonFilter : `(${taxonFilter} AND ${uidFilter})`;
+  const ssrsUids = ['dr382', 'dr1711', 'dr1712', 'dr1713', 'dr2140', 'dr383', 'dr659', 'dr949'];
+  const uidFilter = `(dataResourceUid:(${ssrsUids.join(' OR ')}) OR dataResourceName:"Saving Scotland's Red Squirrels"*)`;
   
   const url = `https://records-ws.nbnatlas.org/occurrences/search`;
   const currentYear = new Date().getFullYear();
@@ -101,18 +98,19 @@ async function fetchAllSightings(species: 'red' | 'grey' | 'marten', forceReset:
   
   try {
     // Get accurate global total first
+    // For squirrels we only care about SSRS, for marten we want everything in Scotland
+    const query = species === 'marten' ? taxonFilter : `(${taxonFilter} AND ${uidFilter})`;
+    const geoFq = `decimalLatitude:[54.0 TO 62.0] AND decimalLongitude:[-11.0 TO 2.0]`;
+
     const globalCheck = await axios.get(url, {
       params: {
         q: query,
-        fq: [
-          `decimalLatitude:[54.0 TO 62.0]`,
-          `decimalLongitude:[-11.0 TO 2.0]`,
-          `year:[2008 TO ${currentYear}]`
-        ],
+        fq: `${geoFq} AND year:[2008 TO ${currentYear}]`,
         pageSize: 0
       }
     });
 
+    console.log(`[Sync] ${species}: Global check URL: ${url}?q=${encodeURIComponent(query)}&fq=${encodeURIComponent(geoFq)}`);
     const totalExpected = globalCheck.data.totalRecords || 0;
     syncStatus[species].totalEstimated = totalExpected;
     syncStatus[species].count = recordMap.size;
@@ -125,26 +123,21 @@ async function fetchAllSightings(species: 'red' | 'grey' | 'marten', forceReset:
       syncStatus[species].count = 0;
     }
 
-    // Sync most recent years first for immediate feedback
+    // Sync most recent years first
     for (let year = currentYear; year >= 2008; year--) {
       syncStatus[species].currentYear = year;
       
       const yearCheck = await axios.get(url, {
         params: {
           q: query,
-          fq: [
-            `decimalLatitude:[54.0 TO 62.0]`,
-            `decimalLongitude:[-11.0 TO 2.0]`,
-            `year:[${year} TO ${year}]`
-          ],
+          fq: `${geoFq} AND year:${year}`,
           pageSize: 0
         }
       });
       const yearTotal = yearCheck.data.totalRecords || 0;
-      if (yearTotal === 0) {
-        console.log(`[Sync] ${species} ${year}: 0 records, skipping.`);
-        continue;
-      }
+      console.log(`[Sync] ${species} ${year}: Found ${yearTotal} records`);
+      
+      if (yearTotal === 0) continue;
 
       const months = yearTotal > 4500 ? [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] : [null];
 
@@ -155,22 +148,17 @@ async function fetchAllSightings(species: 'red' | 'grey' | 'marten', forceReset:
         const pageSize = 1000;
         let hasMoreInPeriod = true;
 
-        const fq = [
-          `decimalLatitude:[54.0 TO 62.0]`,
-          `decimalLongitude:[-11.0 TO 2.0]`,
-          `year:[${year} TO ${year}]`
-        ];
-        if (month) fq.push(`month:[${month} TO ${month}]`);
+        const periodFq = `${geoFq} AND year:${year}${month ? ' AND month:' + month : ''}`;
 
         while (hasMoreInPeriod) {
           try {
             const response = await axios.get(url, {
               params: {
                 q: query,
-                fq: fq,
+                fq: periodFq,
                 pageSize: pageSize,
                 start: startOffset,
-                fl: "id,decimalLatitude,decimalLongitude,year,scientificName,raw_commonName,occurrenceDate,dataResourceName,dataResourceUid",
+                fl: "id,uuid,decimalLatitude,decimalLongitude,year,scientificName,raw_commonName,occurrenceDate,dataResourceName,dataResourceUid",
               },
               timeout: 60000
             });
@@ -185,34 +173,21 @@ async function fetchAllSightings(species: 'red' | 'grey' | 'marten', forceReset:
             }
 
             const rawFetchedCount = records.length;
-            const scientificNameTarget = (
-              species === "red" ? "Sciurus vulgaris" : 
-              species === "grey" ? "Sciurus carolinensis" : 
-              "Martes martes"
-            ).toLowerCase();
-            
             let matchedInBatch = 0;
             records.forEach((r: any) => {
-              const rSciName = (r.scientificName || "").toLowerCase();
-              const rCommonName = (r.raw_commonName || "").toLowerCase();
-              const searchSpecies = species === 'marten' ? 'marten' : species;
-              
-              const matchesSpecies = rSciName.includes(scientificNameTarget) || 
-                                     rCommonName.includes(searchSpecies) ||
-                                     rSciName.includes("sciurus") || 
-                                     (species === 'marten' && rSciName.includes("martes"));
-
-              if (matchesSpecies && r.id) {
-                recordMap.set(r.id, r);
+              const recordId = r.uuid || r.id;
+              if (recordId && isSSRS(r)) {
+                recordMap.set(recordId, r);
+                r.id = recordId; // Ensure id field exists for frontend
                 matchedInBatch++;
               }
             });
 
-            console.log(`[Sync] ${species} ${year}: Fetched ${rawFetchedCount}, Matched ${matchedInBatch}. Map size: ${recordMap.size}`);
             syncStatus[species].count = recordMap.size;
+            // Update store once per batch but avoid massive overhead
             bulkStore[species] = Array.from(recordMap.values());
             
-            if (rawFetchedCount < pageSize || startOffset + rawFetchedCount >= totalInRequest || startOffset + rawFetchedCount >= 5000) {
+            if (rawFetchedCount < pageSize || startOffset + rawFetchedCount >= totalInRequest || startOffset + rawFetchedCount >= 10000) {
               hasMoreInPeriod = false;
             } else {
               startOffset += rawFetchedCount;
@@ -240,14 +215,8 @@ async function fetchAllSightings(species: 'red' | 'grey' | 'marten', forceReset:
   }
 }
 
-// Start initial background sync and load from file
-(async () => {
-  await loadDataFromFile();
-  // If we have very few records, trigger a fresh sync
-  if (bulkStore.red.length < 10000) fetchAllSightings('red');
-  if (bulkStore.grey.length < 500) fetchAllSightings('grey');
-  if (bulkStore.marten.length < 500) fetchAllSightings('marten');
-})();
+// Start initial background sync and load from file - moved inside startServer
+// (async () => { ... })();
 
 const isSSRS = (s: any) => {
   if (!s) return false;
@@ -257,22 +226,47 @@ const isSSRS = (s: any) => {
   if (sciName.includes("martes") || commonName.includes("marten")) {
     return true;
   }
-  const ssrsUids = ['dr382', 'dr1711', 'dr1712', 'dr1713', 'dr2140', 'dr383', 'dr659'];
+  const ssrsUids = ['dr382', 'dr1711', 'dr1712', 'dr1713', 'dr2140', 'dr383', 'dr659', 'dr949'];
   const drName = (s.dataResourceName || "").toLowerCase();
   
   // Be permissive: match if it mentions "Saving Scotland's Red Squirrel" or SSRS
-  const nameMatch = drName.includes("saving scotland") && drName.includes("squirrel");
-  const ssrsAcroMatch = drName.includes("ssrs");
+  const nameMatch = drName.includes("saving scotland") || drName.includes("ssrs");
   const uidMatch = s.dataResourceUid && ssrsUids.includes(s.dataResourceUid);
   
-  return !!(nameMatch || ssrsAcroMatch || uidMatch);
+  return !!(nameMatch || uidMatch);
 };
 
 async function startServer() {
-  const app = express();
-  const PORT = 3000;
+  try {
+    const app = express();
+    const PORT = 3000;
 
-  app.use(express.json());
+    // Load initial data
+    await loadDataFromFile();
+
+    console.log(`[Server] Starting in ${process.env.NODE_ENV || 'development'} mode`);
+
+    app.use(express.json());
+
+  // Log all API requests
+  app.use("/api", (req, res, next) => {
+    console.log(`[API Request] ${req.method} ${req.url}`);
+    next();
+  });
+
+  // Health check
+  app.get("/api/health", (req, res) => {
+    res.json({ 
+      status: "ok", 
+      time: new Date().toISOString(),
+      counts: {
+        red: bulkStore.red.length,
+        grey: bulkStore.grey.length,
+        marten: bulkStore.marten.length
+      },
+      syncStatus
+    });
+  });
 
   // API Route to fetch bulk or filtered sightings
   app.get("/api/sightings", async (req, res) => {
@@ -459,15 +453,13 @@ async function startServer() {
   app.get("/api/sources-diagnostic", async (req, res) => {
     try {
       const { species } = req.query;
-      const lsid = species === "grey" ? "NHMSYS0000080184" : "NHMSYS0000080188";
-      const taxonId = species === "grey" ? "NBNSYS0000005107" : "NBNSYS0000005108";
-      const sciName = species === "grey" ? "Sciurus carolinensis" : "Sciurus vulgaris";
+      const taxonId = species === "grey" ? "NBNSYS0000005107" : species === "marten" ? "NBNSYS0000005111" : "NBNSYS0000005108";
       const url = `https://records-ws.nbnatlas.org/occurrences/search`;
       
       const response = await axios.get(url, {
         params: {
-          q: `scientificName:"${sciName}" OR taxonConceptID:${taxonId} OR lsid:${lsid} OR dataResourceUid:dr949`,
-          fq: `decimalLatitude:[54.0 TO 61.0]`,
+          q: `taxonConceptID:${taxonId}`,
+          fq: `decimalLatitude:[54.0 TO 62.0] AND decimalLongitude:[-11.0 TO 2.0]`,
           facets: "dataResourceName",
           pageSize: 0,
           flimit: 100
@@ -507,6 +499,21 @@ async function startServer() {
     }
   });
 
+  // Global error handler for API routes
+  app.use("/api", (err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+    console.error(`[API Error] ${req.method} ${req.url}:`, err);
+    res.status(500).json({ 
+      error: "Internal Server Error", 
+      message: err.message,
+      stack: process.env.NODE_ENV === 'development' ? err.stack : undefined
+    });
+  });
+
+  // Explicit 404 for missing API routes to avoid returning SPA HTML
+  app.use("/api/*", (req, res) => {
+    res.status(404).json({ error: "API route not found" });
+  });
+
   // Vite middleware for development
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
@@ -522,9 +529,21 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://localhost:${PORT}`);
-  });
+    // If we have no records, trigger a fresh sync in background
+    setTimeout(() => {
+      if (bulkStore.red.length === 0) fetchAllSightings('red');
+      if (bulkStore.grey.length === 0) fetchAllSightings('grey');
+      if (bulkStore.marten.length === 0) fetchAllSightings('marten');
+    }, 5000);
+
+    app.listen(PORT, "0.0.0.0", () => {
+      console.log(`[Server] Squirrel Explorer API running on port ${PORT}`);
+      console.log(`[Server] Health check: http://0.0.0.0:${PORT}/api/health`);
+    });
+  } catch (err) {
+    console.error("[Server] Fatal error during startup:", err);
+    process.exit(1);
+  }
 }
 
 startServer();
