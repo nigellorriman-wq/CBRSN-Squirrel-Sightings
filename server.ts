@@ -85,15 +85,21 @@ async function fetchAllSightings(species: 'red' | 'grey', forceReset: boolean = 
 
   try {
     // Get accurate global total first
+    const ssrsFilter = `(dataResourceUid:dr382 OR dataResourceUid:dr1711 OR dataResourceUid:dr1712 OR dataResourceUid:dr659 OR dataResourceName:"Saving Scotland's Red Squirrels"*)`;
     const globalCheck = await axios.get(url, {
       params: {
         q: query,
-        fq: [`decimalLatitude:[54.5 TO 61.0]`, `decimalLongitude:[-8.5 TO -0.5]`, `year:[2008 TO ${currentYear}]`],
+        fq: [`decimalLatitude:[54.0 TO 62.0]`, `decimalLongitude:[-9.0 TO 0.0]`, `year:[2008 TO ${currentYear}]`, ssrsFilter],
         pageSize: 0
       }
     });
     syncStatus[species].totalEstimated = globalCheck.data.totalRecords || 0;
     syncStatus[species].count = 0;
+
+    // Reset current store for this species if force resetting to ensure only SSRS data remains
+    if (forceReset) {
+      bulkStore[species] = [];
+    }
 
     for (let year = 2008; year <= currentYear; year++) {
       syncStatus[species].currentYear = year;
@@ -101,7 +107,7 @@ async function fetchAllSightings(species: 'red' | 'grey', forceReset: boolean = 
       const yearCheck = await axios.get(url, {
         params: {
           q: query,
-          fq: [`decimalLatitude:[54.5 TO 61.0]`, `decimalLongitude:[-8.5 TO -0.5]`, `year:${year}`],
+          fq: [`decimalLatitude:[54.0 TO 62.0]`, `decimalLongitude:[-9.0 TO 0.0]`, `year:${year}`, ssrsFilter],
           pageSize: 0
         }
       });
@@ -118,9 +124,10 @@ async function fetchAllSightings(species: 'red' | 'grey', forceReset: boolean = 
         let hasMoreInPeriod = true;
 
         const fq = [
-          `decimalLatitude:[54.5 TO 61.0]`,
-          `decimalLongitude:[-8.5 TO -0.5]`,
-          `year:${year}`
+          `decimalLatitude:[54.0 TO 62.0]`,
+          `decimalLongitude:[-9.0 TO 0.0]`,
+          `year:${year}`,
+          ssrsFilter
         ];
         if (month) fq.push(`month:${month}`);
 
@@ -132,9 +139,9 @@ async function fetchAllSightings(species: 'red' | 'grey', forceReset: boolean = 
                 fq: fq,
                 pageSize: pageSize,
                 start: startOffset,
-                fl: "id,decimalLatitude,decimalLongitude,year,species,raw_commonName,occurrenceDate,dataResourceName,dataResourceUid",
+                fl: "id,decimalLatitude,decimalLongitude,year,species,scientificName,raw_commonName,occurrenceDate,dataResourceName,dataResourceUid",
               },
-              timeout: 60000
+              timeout: 90000 // Increased timeout for potentially large responses
             });
 
             let records = response.data.occurrences || [];
@@ -146,20 +153,17 @@ async function fetchAllSightings(species: 'red' | 'grey', forceReset: boolean = 
             }
 
             const rawFetchedCount = records.length;
-            const scientificNameTarget = species === "red" ? "Sciurus vulgaris" : "Sciurus carolinensis";
+            const scientificNameTarget = (species === "red" ? "Sciurus vulgaris" : "Sciurus carolinensis").toLowerCase();
             
-            records = records.filter((r: any) => 
-              r.species === scientificNameTarget || 
-              r.scientificName === scientificNameTarget ||
-              (r.raw_commonName && r.raw_commonName.toLowerCase().includes(species))
-            );
+            // Be more permissive with name matching to avoid dropping valid records due to metadata variations
+            records = records.filter((r: any) => {
+              const rSciName = (r.scientificName || r.species || "").toLowerCase();
+              const rCommonName = (r.raw_commonName || "").toLowerCase();
+              return rSciName.includes(scientificNameTarget) || rCommonName.includes(species);
+            });
 
             allRecords = [...allRecords, ...records];
             syncStatus[species].count = allRecords.length;
-
-            records.forEach((r: any) => {
-              if (r.dataResourceName) foundSources.add(r.dataResourceName);
-            });
             
             if (rawFetchedCount < pageSize || startOffset + pageSize >= totalResults || startOffset + pageSize >= 5000) {
               hasMoreInPeriod = false;
@@ -169,7 +173,7 @@ async function fetchAllSightings(species: 'red' | 'grey', forceReset: boolean = 
           } catch (err: any) {
             console.error(`[Bulk Load] Error at ${year}${month ? '-' + month : ''}, offset ${startOffset}:`, err.message);
             hasMoreInPeriod = false; 
-            await new Promise(r => setTimeout(r, 1000));
+            await new Promise(r => setTimeout(r, 2000));
           }
         }
       }
@@ -197,6 +201,13 @@ async function fetchAllSightings(species: 'red' | 'grey', forceReset: boolean = 
   if (bulkStore.grey.length < 500) fetchAllSightings('grey');
 })();
 
+const isSSRS = (s: any) => {
+  const ssrsUids = ['dr382', 'dr1711', 'dr1712', 'dr1713', 'dr2140', 'dr383', 'dr659'];
+  const nameMatch = s.dataResourceName && s.dataResourceName.includes("Saving Scotland's Red Squirrels");
+  const uidMatch = s.dataResourceUid && ssrsUids.includes(s.dataResourceUid);
+  return !!(nameMatch || uidMatch);
+};
+
 async function startServer() {
   const app = express();
   const PORT = 3000;
@@ -219,7 +230,8 @@ async function startServer() {
       }
     }
 
-    let results = bulkStore[speciesKey];
+    // Strictly filter to SSRS only, even for cached data
+    let results = bulkStore[speciesKey].filter(isSSRS);
 
     // 1. Time Filter
     if (startYear || endYear) {
@@ -246,11 +258,11 @@ async function startServer() {
     
     // 3. Thinning Logic
     // If zoomed in (e.g. village level) or if few records, don't thin
-    const shouldThin = totalCountInBounds > 5000 && currentZoom < 13;
+    const shouldThin = totalCountInBounds > 10000 && currentZoom < 13;
     const isThinned = shouldThin;
     
     if (shouldThin) {
-      const MAX_POINTS = 5000;
+      const MAX_POINTS = 10000;
       // Grid-based spatial sampling to preserve local clusters and geographic distribution
       // Default bounding box or provided bounds
       const minLat = latMin ? parseFloat(latMin as string) : 54.5;
@@ -316,7 +328,7 @@ async function startServer() {
       const lon = parseFloat(s.decimalLongitude);
       const inBounds = lat >= l1 && lat <= l2 && lon >= ln1 && lon <= ln2;
       const inTime = s.year >= start && s.year <= end;
-      return inBounds && inTime;
+      return inBounds && inTime && isSSRS(s);
     };
 
     bulkStore.red.filter(filterInBounds).forEach(s => {

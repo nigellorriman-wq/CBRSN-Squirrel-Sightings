@@ -145,7 +145,6 @@ export default function App() {
   const [isSyncing, setIsSyncing] = useState(false);
   const [syncProgress, setSyncProgress] = useState<any>(null);
   const [syncStatusMap, setSyncStatusMap] = useState<Record<string, any>>({});
-  const [selectedSource, setSelectedSource] = useState<string>("All Sources");
   const [mapBounds, setMapBounds] = useState<any>(null);
   const [mapZoom, setMapZoom] = useState(10);
   const [populationTimeline, setPopulationTimeline] = useState<any[]>([]);
@@ -288,14 +287,9 @@ export default function App() {
     return () => clearInterval(interval);
   }, [isSyncing, species, debouncedRange.start, debouncedRange.end]);
 
-  // Derived data
-  const filteredSightings = useMemo(() => {
-    return sightings;
-  }, [sightings]);
-
   // Memoized Map Markers to prevent re-renders during map move/sidebar toggle
   const markerLayers = useMemo(() => {
-    return filteredSightings.map((sighting, index) => (
+    return sightings.map((sighting, index) => (
       <CircleMarker
         key={`${sighting.id}-${index}`}
         center={[parseFloat(sighting.decimalLatitude), parseFloat(sighting.decimalLongitude)]}
@@ -342,7 +336,7 @@ export default function App() {
         </Tooltip>
       </CircleMarker>
     ));
-  }, [filteredSightings, markerScale, markerShape, species]);
+  }, [sightings, markerScale, markerShape, species]);
 
   const refreshData = async () => {
     setLoading(true);
@@ -397,12 +391,6 @@ export default function App() {
       {/* Header */}
       <header className="h-16 border-b border-stone-200 bg-white/80 backdrop-blur-md flex items-center justify-between px-6 shrink-0 z-30">
         <div className="flex items-center gap-3">
-          <img 
-            src={logo} 
-            alt="Central Borders Red Squirrel Network" 
-            className="w-12 h-12 object-contain rounded-full bg-white shadow-sm"
-            referrerPolicy="no-referrer"
-          />
           <div>
             <h1 className="text-lg font-bold text-stone-900 leading-tight">Scottish Squirrel Explorer</h1>
             <p className="text-[10px] text-stone-500 uppercase tracking-widest font-semibold italic">Central Borders Red Squirrel Network</p>
@@ -729,7 +717,7 @@ export default function App() {
 
         {/* Map Container */}
         <main className="flex-1 overflow-hidden relative">
-          {!loading && filteredSightings.length === 0 && mapBounds && debouncedBounds === mapBounds && (
+          {!loading && sightings.length === 0 && mapBounds && debouncedBounds === mapBounds && (
             <div className="absolute inset-0 z-10 flex items-center justify-center bg-white/50 backdrop-blur-sm pointer-events-none">
               <div className="bg-white p-6 rounded-3xl shadow-2xl border border-red-100 text-center max-w-xs pointer-events-auto">
                 <Info className="w-10 h-10 text-red-600 mx-auto mb-4" />
