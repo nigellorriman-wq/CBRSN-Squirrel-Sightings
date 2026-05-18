@@ -1,8 +1,9 @@
 import { useEffect, useState, useMemo } from 'react';
-import { MapContainer, TileLayer, CircleMarker, Tooltip, ZoomControl, useMapEvents } from 'react-leaflet';
+import { MapContainer, TileLayer, CircleMarker, Tooltip, ZoomControl, useMapEvents, Polygon } from 'react-leaflet';
 import { motion, AnimatePresence } from 'motion/react';
 import { Filter, Calendar, Info, Layers, ChevronRight, ChevronLeft, MapPin, ZoomIn, Download, TrendingUp, BarChart3 } from 'lucide-react';
 import { Sighting } from './types';
+import { SQUIRREL_GROUPS } from './groups_data';
 import { 
   LineChart, 
   Line, 
@@ -94,6 +95,17 @@ function getSourceColor(source: string | undefined): string {
   return `hsl(${Math.abs(hash) % 360}, 70%, 50%)`;
 }
 
+function isPointInPolygon(lat: number, lon: number, polygon: [number, number][]) {
+  let inside = false;
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    const xi = polygon[i][0], yi = polygon[i][1];
+    const xj = polygon[j][0], yj = polygon[j][1];
+    const intersect = ((yi > lon) !== (yj > lon)) && (lat < (xj - xi) * (lon - yi) / (yj - yi) + xi);
+    if (intersect) inside = !inside;
+  }
+  return inside;
+}
+
 // Map Event Controller for Distance and Bounds Calculation
 function MapController({ 
   setBounds,
@@ -129,6 +141,25 @@ function MapController({
   return null;
 }
 
+function GroupZoomController({ selectedGroup }: { selectedGroup: string | null }) {
+  const map = useMapEvents({});
+  useEffect(() => {
+    if (selectedGroup) {
+      const groupData = SQUIRREL_GROUPS.find(g => g.name === selectedGroup);
+      if (groupData && groupData.polygon.length > 0) {
+        const lats = groupData.polygon.map(p => p[0]);
+        const lons = groupData.polygon.map(p => p[1]);
+        const bounds: [[number, number], [number, number]] = [
+          [Math.min(...lats), Math.min(...lons)],
+          [Math.max(...lats), Math.max(...lons)]
+        ];
+        map.fitBounds(bounds, { padding: [50, 50], animate: true });
+      }
+    }
+  }, [selectedGroup, map]);
+  return null;
+}
+
 export default function App() {
   const [sightings, setSightings] = useState<Sighting[]>([]);
   const [loading, setLoading] = useState(false);
@@ -140,6 +171,9 @@ export default function App() {
   const [markerScale, setMarkerScale] = useState(1);
   const [markerShape, setMarkerShape] = useState<'circle' | 'square'>('circle');
   const [colorMode, setColorMode] = useState<'temporal' | 'solid'>('temporal');
+  const [selectedGroup, setSelectedGroup] = useState<string | null>(null);
+  const [showGroupOverlay, setShowGroupOverlay] = useState(false);
+  const [fillGroupAreas, setFillGroupAreas] = useState(true);
   const [mapStyle, setMapStyle] = useState<'standard' | 'topo' | 'satellite'>('standard');
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [distance, setDistance] = useState(0);
@@ -303,8 +337,20 @@ export default function App() {
   }, [isSyncing, species, debouncedRange.start, debouncedRange.end]);
 
   // Memoized Map Markers to prevent re-renders during map move/sidebar toggle
+  const filteredSightings = useMemo(() => {
+    if (!selectedGroup) return sightings;
+    const group = SQUIRREL_GROUPS.find(g => g.name === selectedGroup);
+    if (!group) return sightings;
+    
+    return sightings.filter(s => {
+      const lat = parseFloat(s.decimalLatitude);
+      const lon = parseFloat(s.decimalLongitude);
+      return isPointInPolygon(lat, lon, group.polygon as [number, number][]);
+    });
+  }, [sightings, selectedGroup]);
+
   const markerLayers = useMemo(() => {
-    return sightings.map((sighting, index) => {
+    return filteredSightings.map((sighting, index) => {
       const sType = (sighting as any).speciesType;
       return (
         <CircleMarker
@@ -455,7 +501,7 @@ export default function App() {
           <div className="flex items-center gap-2 px-3 py-1.5 bg-stone-100 rounded-full text-xs font-medium text-stone-600 border border-stone-200">
             <div className={`w-2 h-2 rounded-full ${loading ? 'bg-amber-500 animate-pulse' : 'bg-green-500'}`} />
             <span className="font-mono">
-              {loading ? 'LOADING...' : isThinned ? `SHOWING ${sightings.length.toLocaleString()} OF ${totalRecords.toLocaleString()} RECORDS` : `${totalRecords.toLocaleString()} RECORDS`}
+              {loading ? 'LOADING...' : isThinned ? `SHOWING ${filteredSightings.length.toLocaleString()} OF ${totalRecords.toLocaleString()} RECORDS` : `${filteredSightings.length.toLocaleString()} RECORDS`}
             </span>
           </div>
         </div>
@@ -536,7 +582,65 @@ export default function App() {
                   </div>
                 </div>
 
+                {/* Recovery Network Groups */}
+                <div className="space-y-4 pt-2 border-t border-stone-100">
+                  <h3 className="text-xs font-bold text-stone-400 uppercase tracking-widest mb-4 flex items-center gap-2">
+                    <MapPin className="w-3 h-3" /> Recovery Network
+                  </h3>
+                  
+                  <div className="space-y-3">
+                    <div className="flex items-center justify-between">
+                      <label className="text-[10px] font-bold text-stone-500 uppercase tracking-wider">Show Area Overlays</label>
+                      <button
+                        onClick={() => setShowGroupOverlay(!showGroupOverlay)}
+                        className={`w-10 h-5 rounded-full transition-colors relative ${showGroupOverlay ? 'bg-amber-500' : 'bg-stone-300'}`}
+                      >
+                        <div className={`absolute top-1 w-3 h-3 bg-white rounded-full transition-all ${showGroupOverlay ? 'left-6' : 'left-1'}`} />
+                      </button>
+                    </div>
 
+                    <AnimatePresence>
+                      {showGroupOverlay && (
+                        <motion.div 
+                          initial={{ opacity: 0, height: 0 }}
+                          animate={{ opacity: 1, height: 'auto' }}
+                          exit={{ opacity: 0, height: 0 }}
+                          className="flex items-center justify-between"
+                        >
+                          <label className="text-[10px] font-bold text-stone-500 uppercase tracking-wider pl-2 border-l-2 border-amber-100 italic">Infill Areas</label>
+                          <button
+                            onClick={() => setFillGroupAreas(!fillGroupAreas)}
+                            className={`w-8 h-4 rounded-full transition-colors relative ${fillGroupAreas ? 'bg-amber-400' : 'bg-stone-300'}`}
+                          >
+                            <div className={`absolute top-0.5 w-3 h-3 bg-white rounded-full transition-all ${fillGroupAreas ? 'left-[18px]' : 'left-[2px]'}`} />
+                          </button>
+                        </motion.div>
+                      )}
+                    </AnimatePresence>
+
+                    <div className="space-y-2">
+                      <label className="text-[10px] font-bold text-stone-500 uppercase tracking-wider">Filter by Group Area</label>
+                      <select
+                        value={selectedGroup || ''}
+                        onChange={(e) => setSelectedGroup(e.target.value || null)}
+                        className="w-full bg-stone-50 border border-stone-200 rounded-xl px-3 py-2.5 text-xs font-semibold text-stone-700 focus:outline-none focus:ring-2 focus:ring-amber-500/20 focus:border-amber-500"
+                      >
+                        <option value="">All Areas (No Filter)</option>
+                        {SQUIRREL_GROUPS.slice().sort((a, b) => a.name.localeCompare(b.name)).map((g, idx) => (
+                          <option key={idx} value={g.name}>{g.name}</option>
+                        ))}
+                      </select>
+                      {selectedGroup && (
+                        <button 
+                          onClick={() => setSelectedGroup(null)}
+                          className="text-[9px] font-bold text-red-500 uppercase tracking-widest hover:text-red-600 transition-colors"
+                        >
+                          Clear Group Filter
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                </div>
 
                 {/* Date Range */}
                 <div className="space-y-4">
@@ -807,12 +911,12 @@ export default function App() {
 
         {/* Map Container */}
         <main className="flex-1 overflow-hidden relative">
-          {!loading && sightings.length === 0 && mapBounds && debouncedBounds === mapBounds && (
+          {!loading && filteredSightings.length === 0 && mapBounds && debouncedBounds === mapBounds && (
             <div className="absolute inset-0 z-10 flex items-center justify-center bg-white/50 backdrop-blur-sm pointer-events-none">
               <div className="bg-white p-6 rounded-3xl shadow-2xl border border-red-100 text-center max-w-xs pointer-events-auto">
                 <Info className="w-10 h-10 text-red-600 mx-auto mb-4" />
                 <h3 className="font-bold text-stone-900 mb-2">No Sightings Found</h3>
-                <p className="text-sm text-stone-500">Try broadening the date range or checking the other species.</p>
+                <p className="text-sm text-stone-500">Try broadening the date range{selectedGroup ? ' or clearing the group filter' : ''}.</p>
               </div>
             </div>
           )}
@@ -830,7 +934,23 @@ export default function App() {
             />
             <ZoomControl position="bottomright" />
             <MapController setBounds={setMapBounds} setZoom={setMapZoom} />
+            <GroupZoomController selectedGroup={selectedGroup} />
             
+            {showGroupOverlay && SQUIRREL_GROUPS.map((group, idx) => (
+              <Polygon
+                key={idx}
+                positions={group.polygon as [number, number][]}
+                pathOptions={{
+                  fillColor: selectedGroup === group.name ? '#0288d1' : '#78716c',
+                  fillOpacity: fillGroupAreas ? (selectedGroup === group.name ? 0.3 : 0.1) : 0,
+                  color: selectedGroup === group.name ? '#0288d1' : '#78716c',
+                  weight: selectedGroup === group.name ? 3 : 1
+                }}
+              >
+                <Tooltip sticky>{group.name}</Tooltip>
+              </Polygon>
+            ))}
+
             {markerLayers}
           </MapContainer>
 
@@ -885,7 +1005,7 @@ export default function App() {
               {isThinned && (
                 <div className="pt-2 mt-2 border-t border-amber-100 flex items-center gap-2">
                   <div className="w-1.5 h-1.5 bg-amber-500 rounded-full animate-pulse" />
-                  <span className="text-[9px] font-bold text-amber-700 uppercase tracking-tighter">Sampling {sightings.length.toLocaleString()} points</span>
+                  <span className="text-[9px] font-bold text-amber-700 uppercase tracking-tighter">Sampling {filteredSightings.length.toLocaleString()} points</span>
                 </div>
               )}
             </div>
