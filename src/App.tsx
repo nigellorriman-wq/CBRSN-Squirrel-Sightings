@@ -184,6 +184,7 @@ export default function App() {
   useEffect(() => {
     async function fetchData() {
       setLoading(true);
+      setSightings([]); // Clear existing results immediately to prevent stale 'No sightings' overlay
       try {
         const query = new URLSearchParams({
           species,
@@ -301,8 +302,8 @@ export default function App() {
         radius={4 * markerScale}
         pathOptions={{
           fillColor: getTemporalColor(sighting.occurrenceDate, sighting.year),
-          color: 'white',
-          weight: 1.5,
+          color: species === 'red' ? '#dc2626' : '#78716c',
+          weight: 2.5,
           opacity: 1,
           fillOpacity: 0.9
         }}
