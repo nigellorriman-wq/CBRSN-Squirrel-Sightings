@@ -15,7 +15,8 @@ const DATA_FILE = path.join(DATA_DIR, "squirrel_sightings.json");
 // In-memory store for bulk sightings
 let bulkStore: Record<string, any[]> = {
   red: [],
-  grey: []
+  grey: [],
+  marten: []
 };
 
 let syncStatus: Record<string, { 
@@ -27,7 +28,8 @@ let syncStatus: Record<string, {
   lastSync?: string
 }> = {
   red: { isLoading: false, count: 0, totalEstimated: 0, phase: 'idle' },
-  grey: { isLoading: false, count: 0, totalEstimated: 0, phase: 'idle' }
+  grey: { isLoading: false, count: 0, totalEstimated: 0, phase: 'idle' },
+  marten: { isLoading: false, count: 0, totalEstimated: 0, phase: 'idle' }
 };
 
 async function ensureDataDir() {
@@ -51,15 +53,20 @@ async function loadDataFromFile() {
     if (existsSync(DATA_FILE)) {
       const data = await fs.readFile(DATA_FILE, 'utf-8');
       bulkStore = JSON.parse(data);
-      console.log(`[Persistence] Loaded ${bulkStore.red.length} red and ${bulkStore.grey.length} grey records from file.`);
+      console.log(`[Persistence] Loaded ${bulkStore.red?.length || 0} red, ${bulkStore.grey?.length || 0} grey, and ${bulkStore.marten?.length || 0} marten records from file.`);
+      
+      // Ensure keys exist if it's an old file
+      if (!bulkStore.red) bulkStore.red = [];
+      if (!bulkStore.grey) bulkStore.grey = [];
+      if (!bulkStore.marten) bulkStore.marten = [];
     }
   } catch (error) {
     console.error(`[Persistence] Error loading data:`, error);
   }
 }
 
-async function fetchAllSightings(species: 'red' | 'grey', forceReset: boolean = false) {
-  if (syncStatus[species].isLoading && !forceReset) {
+async function fetchAllSightings(species: 'red' | 'grey' | 'marten', forceReset: boolean = false) {
+  if (syncStatus[species]?.isLoading && !forceReset) {
     console.log(`[Sync] Already in progress for ${species}.`);
     return;
   }
@@ -73,11 +80,13 @@ async function fetchAllSightings(species: 'red' | 'grey', forceReset: boolean = 
     currentYear: 2008
   };
   
-  console.log(`[Bulk Load] Starting sync for ${species} squirrels in Scotland (Year by Year)...`);
-  const lsid = species === "grey" ? "NHMSYS0000080184" : "NHMSYS0000080188";
+  console.log(`[Bulk Load] Starting sync for ${species} in Scotland (Year by Year)...`);
   const query = species === "red" 
     ? `(scientificName:"Sciurus vulgaris" OR taxonConceptID:NBNSYS0000005108 OR lsid:NHMSYS0000080188)`
-    : `(scientificName:"Sciurus carolinensis" OR taxonConceptID:NBNSYS0000005107 OR lsid:NHMSYS0000080184)`;
+    : species === "grey"
+      ? `(scientificName:"Sciurus carolinensis" OR taxonConceptID:NBNSYS0000005107 OR lsid:NHMSYS0000080184)`
+      : `(scientificName:"Martes martes" OR taxonConceptID:NBNSYS0000005111 OR lsid:NHMSYS0000080190)`;
+  
   const url = `https://records-ws.nbnatlas.org/occurrences/search`;
   const currentYear = new Date().getFullYear();
   let allRecords: any[] = [];
@@ -86,17 +95,22 @@ async function fetchAllSightings(species: 'red' | 'grey', forceReset: boolean = 
   try {
     // Get accurate global total first
     const ssrsFilter = `(dataResourceUid:dr382 OR dataResourceUid:dr1711 OR dataResourceUid:dr1712 OR dataResourceUid:dr659 OR dataResourceName:"Saving Scotland's Red Squirrels"*)`;
+    
+    // For Martens, we want ALL data as requested by user, no special filter
+    const activeFilter = species === 'marten' ? 'occurrenceStatus:present' : ssrsFilter;
+
     const globalCheck = await axios.get(url, {
       params: {
         q: query,
-        fq: [`decimalLatitude:[54.0 TO 62.0]`, `decimalLongitude:[-9.0 TO 0.0]`, `year:[2008 TO ${currentYear}]`, ssrsFilter],
+        fq: [`decimalLatitude:[54.0 TO 62.0]`, `decimalLongitude:[-9.0 TO 0.0]`, `year:[2008 TO ${currentYear}]`, activeFilter],
         pageSize: 0
       }
     });
+
     syncStatus[species].totalEstimated = globalCheck.data.totalRecords || 0;
     syncStatus[species].count = 0;
 
-    // Reset current store for this species if force resetting to ensure only SSRS data remains
+    // Reset current store for this species if force resetting
     if (forceReset) {
       bulkStore[species] = [];
     }
@@ -107,7 +121,7 @@ async function fetchAllSightings(species: 'red' | 'grey', forceReset: boolean = 
       const yearCheck = await axios.get(url, {
         params: {
           q: query,
-          fq: [`decimalLatitude:[54.0 TO 62.0]`, `decimalLongitude:[-9.0 TO 0.0]`, `year:${year}`, ssrsFilter],
+          fq: [`decimalLatitude:[54.0 TO 62.0]`, `decimalLongitude:[-9.0 TO 0.0]`, `year:${year}`, activeFilter],
           pageSize: 0
         }
       });
@@ -127,7 +141,7 @@ async function fetchAllSightings(species: 'red' | 'grey', forceReset: boolean = 
           `decimalLatitude:[54.0 TO 62.0]`,
           `decimalLongitude:[-9.0 TO 0.0]`,
           `year:${year}`,
-          ssrsFilter
+          activeFilter
         ];
         if (month) fq.push(`month:${month}`);
 
@@ -153,13 +167,18 @@ async function fetchAllSightings(species: 'red' | 'grey', forceReset: boolean = 
             }
 
             const rawFetchedCount = records.length;
-            const scientificNameTarget = (species === "red" ? "Sciurus vulgaris" : "Sciurus carolinensis").toLowerCase();
+            const scientificNameTarget = (
+              species === "red" ? "Sciurus vulgaris" : 
+              species === "grey" ? "Sciurus carolinensis" : 
+              "Martes martes"
+            ).toLowerCase();
             
             // Be more permissive with name matching to avoid dropping valid records due to metadata variations
             records = records.filter((r: any) => {
               const rSciName = (r.scientificName || r.species || "").toLowerCase();
               const rCommonName = (r.raw_commonName || "").toLowerCase();
-              return rSciName.includes(scientificNameTarget) || rCommonName.includes(species);
+              const searchSpecies = species === 'marten' ? 'marten' : species;
+              return rSciName.includes(scientificNameTarget) || rCommonName.includes(searchSpecies);
             });
 
             allRecords = [...allRecords, ...records];
@@ -196,12 +215,17 @@ async function fetchAllSightings(species: 'red' | 'grey', forceReset: boolean = 
 // Start initial background sync and load from file
 (async () => {
   await loadDataFromFile();
-  // If we have very few records (like the old query results), trigger a fresh sync
+  // If we have very few records, trigger a fresh sync
   if (bulkStore.red.length < 10000) fetchAllSightings('red');
   if (bulkStore.grey.length < 500) fetchAllSightings('grey');
+  if (bulkStore.marten.length < 500) fetchAllSightings('marten');
 })();
 
 const isSSRS = (s: any) => {
+  // Broad acceptance for Martens as per user request
+  if (s.scientificName?.toLowerCase().includes("martes") || s.species?.toLowerCase().includes("martes") || s.raw_commonName?.toLowerCase().includes("marten")) {
+    return true;
+  }
   const ssrsUids = ['dr382', 'dr1711', 'dr1712', 'dr1713', 'dr2140', 'dr383', 'dr659'];
   const nameMatch = s.dataResourceName && s.dataResourceName.includes("Saving Scotland's Red Squirrels");
   const uidMatch = s.dataResourceUid && ssrsUids.includes(s.dataResourceUid);
@@ -218,11 +242,13 @@ async function startServer() {
   app.get("/api/sightings", async (req, res) => {
     const { species, startYear, endYear, latMin, latMax, lonMin, lonMax, zoom, forceRefresh } = req.query;
     
-    const speciesKey = (species as 'red' | 'grey') || 'red';
+    // Validate speciesKey
+    const speciesInQuery = species as string;
+    const speciesKey = (['red', 'grey', 'marten'].includes(speciesInQuery) ? speciesInQuery : 'red') as 'red' | 'grey' | 'marten';
 
     // Check if we need to trigger a load
-    if (bulkStore[speciesKey].length === 0 || forceRefresh === 'true') {
-      if (bulkStore[speciesKey].length === 0) {
+    if (!bulkStore[speciesKey] || bulkStore[speciesKey].length === 0 || forceRefresh === 'true') {
+      if (!bulkStore[speciesKey] || bulkStore[speciesKey].length === 0) {
         await fetchAllSightings(speciesKey);
       } else {
         // Trigger background sync but don't wait for it
@@ -230,8 +256,8 @@ async function startServer() {
       }
     }
 
-    // Strictly filter to SSRS only, even for cached data
-    let results = bulkStore[speciesKey].filter(isSSRS);
+    // Filter to valid records
+    let results = (bulkStore[speciesKey] || []).filter(isSSRS);
 
     // 1. Time Filter
     if (startYear || endYear) {
@@ -303,7 +329,7 @@ async function startServer() {
       occurrences: results,
       total: totalCountInBounds,
       thinned: isThinned,
-      isSyncing: syncStatus[speciesKey].isLoading
+      isSyncing: syncStatus[speciesKey]?.isLoading || false
     });
   });
 
@@ -313,9 +339,9 @@ async function startServer() {
     const start = parseInt(startYear as string) || 2008;
     const end = parseInt(endYear as string) || new Date().getFullYear();
     
-    const stats: Record<number, { red: number; grey: number }> = {};
+    const stats: Record<number, { red: number; grey: number; marten: number }> = {};
     for (let y = start; y <= end; y++) {
-      stats[y] = { red: 0, grey: 0 };
+      stats[y] = { red: 0, grey: 0, marten: 0 };
     }
 
     const l1 = latMin ? parseFloat(latMin as string) : -90;
@@ -337,6 +363,9 @@ async function startServer() {
     bulkStore.grey.filter(filterInBounds).forEach(s => {
       if (stats[s.year]) stats[s.year].grey++;
     });
+    bulkStore.marten.filter(filterInBounds).forEach(s => {
+      if (stats[s.year]) stats[s.year].marten++;
+    });
 
     const timeline = Object.entries(stats).map(([year, counts]) => ({
       year: parseInt(year),
@@ -350,7 +379,7 @@ async function startServer() {
   app.get("/api/stats-csv", async (req, res) => {
     try {
       const sourceCounts: Record<string, number> = {};
-      const allSightings = [...bulkStore.red, ...bulkStore.grey];
+      const allSightings = [...bulkStore.red, ...bulkStore.grey, ...bulkStore.marten];
       
       allSightings.forEach(s => {
         const source = s.dataResourceName || "Unknown Source";
@@ -415,8 +444,8 @@ async function startServer() {
 
   app.get("/api/force-refresh", async (req, res) => {
     const { species } = req.query;
-    if (species === "red" || species === "grey") {
-      fetchAllSightings(species as 'red' | 'grey', true);
+    if (species === "red" || species === "grey" || species === "marten") {
+      fetchAllSightings(species as 'red' | 'grey' | 'marten', true);
       res.json({ message: `Sync started for ${species}` });
     } else {
       res.status(400).json({ error: "Invalid species" });

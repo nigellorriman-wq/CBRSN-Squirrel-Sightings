@@ -134,7 +134,7 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [isThinned, setIsThinned] = useState(false);
   const [totalRecords, setTotalRecords] = useState(0);
-  const [species, setSpecies] = useState<'red' | 'grey'>('red');
+  const [species, setSpecies] = useState<('red' | 'grey' | 'marten')[]>(['red']);
   const [startYear, setStartYear] = useState(2008);
   const [endYear, setEndYear] = useState(new Date().getFullYear());
   const [markerScale, setMarkerScale] = useState(1);
@@ -185,30 +185,31 @@ export default function App() {
       setLoading(true);
       setSightings([]); // Clear existing results immediately to prevent stale 'No sightings' overlay
       try {
-        const query = new URLSearchParams({
-          species,
-          startYear: debouncedRange.start.toString(),
-          endYear: debouncedRange.end.toString(),
-        });
+        const results = await Promise.all(species.map(async (s) => {
+          const query = new URLSearchParams({
+            species: s,
+            startYear: debouncedRange.start.toString(),
+            endYear: debouncedRange.end.toString(),
+          });
 
-        if (debouncedBounds) {
-          query.append('latMin', debouncedBounds.latMin.toString());
-          query.append('latMax', debouncedBounds.latMax.toString());
-          query.append('lonMin', debouncedBounds.lonMin.toString());
-          query.append('lonMax', debouncedBounds.lonMax.toString());
-          query.append('zoom', mapZoom.toString());
-        }
+          if (debouncedBounds) {
+            query.append('latMin', debouncedBounds.latMin.toString());
+            query.append('latMax', debouncedBounds.latMax.toString());
+            query.append('lonMin', debouncedBounds.lonMin.toString());
+            query.append('lonMax', debouncedBounds.lonMax.toString());
+            query.append('zoom', mapZoom.toString());
+          }
 
-        const response = await fetch(`/api/sightings?${query}`);
-        if (!response.ok) throw new Error('API Error');
-        const data = await response.json();
-        
-        if (data.occurrences) {
-          setSightings(data.occurrences);
-          setTotalRecords(data.total || 0);
-          setIsThinned(data.thinned || false);
-        }
-        setIsSyncing(data.isSyncing);
+          const response = await fetch(`/api/sightings?${query}`);
+          if (!response.ok) throw new Error('API Error');
+          const data = await response.json();
+          return (data.occurrences || []).map((occ: any) => ({ ...occ, speciesType: s }));
+        }));
+
+        const merged = results.flat();
+        setSightings(merged);
+        setTotalRecords(merged.length);
+        setIsThinned(merged.length > 5000); // Simple thinning heuristic for merged set
       } catch (error) {
         console.error('Fetch error:', error);
       } finally {
@@ -249,32 +250,30 @@ export default function App() {
     const checkStatus = async () => {
       try {
         const res = await fetch('/api/sync-status');
+        if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
         const data = await res.json();
-        setSyncStatusMap(data);
         
-        // Check status for BOTH species
-        const redStatus = data.red;
-        const greyStatus = data.grey;
-        const currentlyLoading = redStatus.isLoading || greyStatus.isLoading;
-        
-        // Update progress for current species
-        setSyncProgress(data[species]);
-        
-        // If the viewed species just finished loading, refresh its data
-        const speciesJustFinished = !data[species].isLoading && syncStatusMap[species]?.isLoading;
-        
-        if (speciesJustFinished) {
-           const sightingsRes = await fetch(`/api/sightings?species=${species}&startYear=${debouncedRange.start}&endYear=${debouncedRange.end}`);
-           const sightingsData = await sightingsRes.json();
-           setSightings(sightingsData.occurrences);
-           setTotalRecords(sightingsData.total || 0);
-           setIsThinned(sightingsData.thinned || false);
+        if (data && typeof data === 'object') {
+          setSyncStatusMap(data);
+          
+          // Status for all species - handle missing data gracefully
+          const redLoading = data.red?.isLoading || false;
+          const greyLoading = data.grey?.isLoading || false;
+          const martenLoading = data.marten?.isLoading || false;
+          const currentlyLoading = redLoading || greyLoading || martenLoading;
+          
+          // Update progress for selected species (take first one as representative)
+          if (species.length > 0 && data[species[0]]) {
+            setSyncProgress(data[species[0]]);
+          } else {
+            setSyncProgress(null);
+          }
+          
+          setIsSyncing(currentlyLoading);
         }
-
-        setIsSyncing(currentlyLoading);
-        
       } catch (err) {
         console.error('Sync status check error:', err);
+        // Only stop syncing on fatal network errors, not on transient check errors
       }
     };
 
@@ -289,63 +288,68 @@ export default function App() {
 
   // Memoized Map Markers to prevent re-renders during map move/sidebar toggle
   const markerLayers = useMemo(() => {
-    return sightings.map((sighting, index) => (
-      <CircleMarker
-        key={`${sighting.id}-${index}`}
-        center={[parseFloat(sighting.decimalLatitude), parseFloat(sighting.decimalLongitude)]}
-        radius={4 * markerScale}
-        pathOptions={{
-          fillColor: getTemporalColor(sighting.occurrenceDate, sighting.year),
-          color: species === 'red' ? '#dc2626' : '#78716c',
-          weight: 2.5,
-          opacity: 1,
-          fillOpacity: 0.9
-        }}
-        className={markerShape === 'square' ? 'leaflet-marker-square' : ''}
-      >
-        <Tooltip direction="top" offset={[0, -5]} opacity={1}>
-          <div className="font-sans px-2 py-1 min-w-[120px]">
-            <p className="font-bold text-stone-900 border-b border-stone-100 mb-1 pb-1">
-              {sighting.raw_commonName || (species === 'red' ? 'Red Squirrel' : 'Grey Squirrel')}
-            </p>
-            <div className="flex justify-between items-center text-[10px] text-stone-500 font-semibold mb-1">
-              <span>YEAR</span>
-              <span className="text-stone-900">{sighting.year}</span>
-            </div>
-            {sighting.occurrenceDate && (
-              <>
-                <div className="flex justify-between items-center text-[10px] text-stone-500 font-semibold mb-1">
-                  <span>MONTH</span>
-                  <span className="text-stone-900">
-                    {new Date(sighting.occurrenceDate).toLocaleString('default', { month: 'long' })}
-                  </span>
-                </div>
-                <div className="flex justify-between items-center text-[10px] text-stone-500 font-semibold mb-1">
-                  <span>FULL DATE</span>
-                  <span className="text-stone-900">{new Date(sighting.occurrenceDate).toLocaleDateString()}</span>
-                </div>
-              </>
-            )}
-            {sighting.dataResourceName && (
-              <div className="pt-1 mt-1 border-t border-stone-100">
-                <p className="text-[8px] text-stone-400 font-bold uppercase tracking-tighter mb-0.5">DATA PROVIDER</p>
-                <p className="text-[10px] text-stone-600 font-medium leading-tight">{sighting.dataResourceName}</p>
+    return sightings.map((sighting, index) => {
+      const sType = (sighting as any).speciesType;
+      return (
+        <CircleMarker
+          key={`${sighting.id}-${index}`}
+          center={[parseFloat(sighting.decimalLatitude), parseFloat(sighting.decimalLongitude)]}
+          radius={4 * markerScale}
+          pathOptions={{
+            fillColor: getTemporalColor(sighting.occurrenceDate, sighting.year),
+            color: sType === 'red' ? '#dc2626' : sType === 'grey' ? '#78716c' : '#713f12',
+            weight: sType === 'marten' ? 4 : 2.5, // Thicker stroke for Marten (brown circle around)
+            opacity: 1,
+            fillOpacity: 0.9,
+            stroke: true
+          }}
+          className={markerShape === 'square' ? 'leaflet-marker-square' : ''}
+        >
+          <Tooltip direction="top" offset={[0, -5]} opacity={1}>
+            <div className="font-sans px-2 py-1 min-w-[120px]">
+              <p className="font-bold text-stone-900 border-b border-stone-100 mb-1 pb-1">
+                {sighting.raw_commonName || (sType === 'red' ? 'Red Squirrel' : sType === 'grey' ? 'Grey Squirrel' : 'Pine Marten')}
+              </p>
+              <div className="flex justify-between items-center text-[10px] text-stone-500 font-semibold mb-1">
+                <span>YEAR</span>
+                <span className="text-stone-900">{sighting.year}</span>
               </div>
-            )}
-          </div>
-        </Tooltip>
-      </CircleMarker>
-    ));
-  }, [sightings, markerScale, markerShape, species]);
+              {sighting.occurrenceDate && (
+                <>
+                  <div className="flex justify-between items-center text-[10px] text-stone-500 font-semibold mb-1">
+                    <span>MONTH</span>
+                    <span className="text-stone-900">
+                      {new Date(sighting.occurrenceDate).toLocaleString('default', { month: 'long' })}
+                    </span>
+                  </div>
+                  <div className="flex justify-between items-center text-[10px] text-stone-500 font-semibold mb-1">
+                    <span>FULL DATE</span>
+                    <span className="text-stone-900">{new Date(sighting.occurrenceDate).toLocaleDateString()}</span>
+                  </div>
+                </>
+              )}
+              {sighting.dataResourceName && (
+                <div className="pt-1 mt-1 border-t border-stone-100">
+                  <p className="text-[8px] text-stone-400 font-bold uppercase tracking-tighter mb-0.5">DATA PROVIDER</p>
+                  <p className="text-[10px] text-stone-600 font-medium leading-tight">{sighting.dataResourceName}</p>
+                </div>
+              )}
+            </div>
+          </Tooltip>
+        </CircleMarker>
+      );
+    });
+  }, [sightings, markerScale, markerShape]);
 
   const refreshData = async () => {
     setLoading(true);
     setIsSyncing(true);
     setSightings([]); // Clear existing data to avoid stale overlay
     try {
-      // Trigger sync for both species
+      // Trigger sync for all species
       await fetch(`/api/force-refresh?species=red`);
       await fetch(`/api/force-refresh?species=grey`);
+      await fetch(`/api/force-refresh?species=marten`);
       
       // The polling will handle the rest
     } catch (err) {
@@ -456,26 +460,60 @@ export default function App() {
                   <h3 className="text-xs font-bold text-stone-400 uppercase tracking-widest mb-4 flex items-center gap-2">
                     <Filter className="w-3 h-3" /> Species Filter
                   </h3>
-                  <div className="grid grid-cols-2 gap-2 bg-stone-100 p-1 rounded-2xl">
+                  <div className="grid grid-cols-3 gap-2 bg-stone-100 p-1 rounded-2xl">
                     <button
-                      onClick={() => setSpecies('red')}
-                      className={`py-2.5 rounded-xl text-sm font-semibold transition-all ${
-                        species === 'red' 
+                      onClick={() => {
+                        setSpecies(prev => {
+                          if (prev.includes('red')) {
+                            if (prev.length === 1) return prev;
+                            return prev.filter(s => s !== 'red');
+                          }
+                          return [...prev, 'red'];
+                        });
+                      }}
+                      className={`py-2.5 rounded-xl text-[10px] font-bold transition-all uppercase tracking-tight ${
+                        species.includes('red') 
                         ? 'bg-red-600 text-white shadow-md' 
-                        : 'text-stone-500 hover:text-stone-700'
+                        : 'bg-white text-stone-500 hover:text-stone-700'
                       }`}
                     >
-                      Red Squirrel
+                      Red
                     </button>
                     <button
-                      onClick={() => setSpecies('grey')}
-                      className={`py-2.5 rounded-xl text-sm font-semibold transition-all ${
-                        species === 'grey' 
+                      onClick={() => {
+                        setSpecies(prev => {
+                          if (prev.includes('grey')) {
+                            if (prev.length === 1) return prev;
+                            return prev.filter(s => s !== 'grey');
+                          }
+                          return [...prev, 'grey'];
+                        });
+                      }}
+                      className={`py-2.5 rounded-xl text-[10px] font-bold transition-all uppercase tracking-tight ${
+                        species.includes('grey') 
                         ? 'bg-stone-500 text-white shadow-md' 
-                        : 'text-stone-500 hover:text-stone-700'
+                        : 'bg-white text-stone-500 hover:text-stone-700'
                       }`}
                     >
-                      Grey Squirrel
+                      Grey
+                    </button>
+                    <button
+                      onClick={() => {
+                        setSpecies(prev => {
+                          if (prev.includes('marten')) {
+                            if (prev.length === 1) return prev;
+                            return prev.filter(s => s !== 'marten');
+                          }
+                          return [...prev, 'marten'];
+                        });
+                      }}
+                      className={`py-2.5 rounded-xl text-[10px] font-bold transition-all uppercase tracking-tight ${
+                        species.includes('marten') 
+                        ? 'bg-[#713f12] text-white shadow-md' 
+                        : 'bg-white text-stone-500 hover:text-stone-700'
+                      }`}
+                    >
+                      Marten
                     </button>
                   </div>
                 </div>
@@ -559,21 +597,28 @@ export default function App() {
                         />
                         <Line type="monotone" dataKey="red" stroke="#ef4444" strokeWidth={2} dot={{ r: 2 }} activeDot={{ r: 4 }} />
                         <Line type="monotone" dataKey="grey" stroke="#78716c" strokeWidth={2} dot={{ r: 2 }} activeDot={{ r: 4 }} />
+                        <Line type="monotone" dataKey="marten" stroke="#713f12" strokeWidth={2} dot={{ r: 2 }} activeDot={{ r: 4 }} />
                       </LineChart>
                     </ResponsiveContainer>
                   </div>
                   
-                  <div className="flex items-center justify-between gap-2 px-1">
+                  <div className="grid grid-cols-3 gap-2 px-1 text-center">
                     <div className="flex flex-col">
-                      <span className="text-[10px] text-stone-400 font-bold uppercase tracking-wider">Red Sightings</span>
-                      <span className="text-lg font-bold text-red-600">
+                      <span className="text-[8px] text-stone-400 font-bold uppercase tracking-wider">Red</span>
+                      <span className="text-xs font-bold text-red-600">
                         {populationTimeline.reduce((sum, d) => sum + d.red, 0).toLocaleString()}
                       </span>
                     </div>
-                    <div className="flex flex-col items-end">
-                      <span className="text-[10px] text-stone-400 font-bold uppercase tracking-wider">Grey Sightings</span>
-                      <span className="text-lg font-bold text-stone-900">
+                    <div className="flex flex-col">
+                      <span className="text-[8px] text-stone-400 font-bold uppercase tracking-wider">Grey</span>
+                      <span className="text-xs font-bold text-stone-900">
                         {populationTimeline.reduce((sum, d) => sum + d.grey, 0).toLocaleString()}
+                      </span>
+                    </div>
+                    <div className="flex flex-col">
+                      <span className="text-[8px] text-stone-400 font-bold uppercase tracking-wider">Marten</span>
+                      <span className="text-xs font-bold text-[#713f12]">
+                        {populationTimeline.reduce((sum, d) => (sum + (d.marten || 0)), 0).toLocaleString()}
                       </span>
                     </div>
                   </div>
@@ -581,11 +626,12 @@ export default function App() {
                   {populationTimeline.length > 2 && (
                     <div className="bg-stone-50 rounded-lg p-2.5 border border-stone-100">
                       <p className="text-[9px] text-stone-500 leading-normal italic">
-                        Based on the current view, sightings for <strong>{species} squirrels</strong> have changed by 
+                        Based on the current view, sightings for <strong>{species.join(' & ')}</strong> have changed by 
                         <span className="font-bold text-stone-900 border-b border-stone-300 ml-1">
                           {(() => {
-                            const first = populationTimeline[0][species] || 0;
-                            const last = populationTimeline[populationTimeline.length - 1][species] || 0;
+                            const primarySpecies = species[0] || 'red';
+                            const first = populationTimeline[0]?.[primarySpecies] || 0;
+                            const last = populationTimeline[populationTimeline.length - 1]?.[primarySpecies] || 0;
                             if (first === 0) return last === 0 ? "0%" : "New Activity";
                             const change = ((last - first) / first) * 100;
                             return `${change > 0 ? '+' : ''}${change.toFixed(0)}%`;
@@ -668,9 +714,9 @@ export default function App() {
                     Fetching from <strong>Saving Scotland's Red Squirrels</strong> database via NBN Atlas.
                   </p>
 
-                  {syncStatusMap[species]?.lastSync && (
+                  {syncStatusMap[species[0]]?.lastSync && (
                     <div className="pt-1 mt-1 border-t border-amber-200 text-[9px] text-amber-600 font-bold">
-                      DATABASE LAST SYNCED: {new Date(syncStatusMap[species].lastSync).toLocaleString()}
+                      DATABASE LAST SYNCED: {new Date(syncStatusMap[species[0]].lastSync).toLocaleString()}
                     </div>
                   )}
                 </div>
@@ -689,7 +735,7 @@ export default function App() {
                   {isSyncing ? (
                     <>
                       <div className="w-3 h-3 border-2 border-amber-600 border-t-transparent rounded-full animate-spin" />
-                      FETCHING {((syncStatusMap.red?.count || 0) + (syncStatusMap.grey?.count || 0)).toLocaleString()} / {((syncStatusMap.red?.totalEstimated || 0) + (syncStatusMap.grey?.totalEstimated || 0)).toLocaleString()}
+                      FETCHING {((syncStatusMap.red?.count || 0) + (syncStatusMap.grey?.count || 0) + (syncStatusMap.marten?.count || 0)).toLocaleString()} / {((syncStatusMap.red?.totalEstimated || 0) + (syncStatusMap.grey?.totalEstimated || 0) + (syncStatusMap.marten?.totalEstimated || 0)).toLocaleString()}
                     </>
                   ) : (
                     'SYNC WITH NBN ATLAS'
@@ -750,7 +796,7 @@ export default function App() {
               <div className="space-y-2 border-b border-stone-100 pb-2">
                 <div className="flex items-center justify-between gap-4">
                   <span className="text-[10px] font-bold text-stone-900 uppercase tracking-widest">
-                    {species === 'red' ? 'Red Squirrel' : 'Grey Squirrel'}
+                    {species.map(s => s === 'red' ? 'Red' : s === 'grey' ? 'Grey' : 'Marten').join(' + ')}
                   </span>
                   <div className={`w-3 h-3 rounded-${markerShape === 'circle' ? 'full' : 'sm'} bg-stone-900 shadow-sm border border-white`} />
                 </div>
