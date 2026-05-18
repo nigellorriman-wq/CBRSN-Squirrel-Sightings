@@ -139,6 +139,7 @@ export default function App() {
   const [endYear, setEndYear] = useState(new Date().getFullYear());
   const [markerScale, setMarkerScale] = useState(1);
   const [markerShape, setMarkerShape] = useState<'circle' | 'square'>('circle');
+  const [colorMode, setColorMode] = useState<'temporal' | 'solid'>('temporal');
   const [mapStyle, setMapStyle] = useState<'standard' | 'topo' | 'satellite'>('standard');
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [distance, setDistance] = useState(0);
@@ -311,7 +312,9 @@ export default function App() {
           center={[parseFloat(sighting.decimalLatitude), parseFloat(sighting.decimalLongitude)]}
           radius={4 * markerScale}
           pathOptions={{
-            fillColor: getTemporalColor(sighting.occurrenceDate, sighting.year),
+            fillColor: colorMode === 'temporal' 
+              ? getTemporalColor(sighting.occurrenceDate, sighting.year) 
+              : (sType === 'red' ? '#dc2626' : sType === 'grey' ? '#78716c' : '#713f12'),
             color: sType === 'red' ? '#dc2626' : sType === 'grey' ? '#78716c' : '#713f12',
             weight: sType === 'marten' ? 4 : 2.5, // Thicker stroke for Marten (brown circle around)
             opacity: 1,
@@ -354,7 +357,7 @@ export default function App() {
         </CircleMarker>
       );
     });
-  }, [sightings, markerScale, markerShape]);
+  }, [sightings, markerScale, markerShape, colorMode]);
 
   const refreshData = async () => {
     setLoading(true);
@@ -700,6 +703,32 @@ export default function App() {
                     </div>
 
                     <div className="space-y-2 pt-2">
+                      <label className="text-[10px] font-bold text-stone-500 uppercase tracking-wider">Coloring Mode</label>
+                      <div className="grid grid-cols-2 gap-2">
+                        <button
+                          onClick={() => setColorMode('temporal')}
+                          className={`px-3 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-tight border transition-all ${
+                            colorMode === 'temporal' 
+                            ? 'bg-stone-900 text-white border-stone-900 shadow-md' 
+                            : 'bg-white text-stone-600 border-stone-200 hover:border-stone-400'
+                          }`}
+                        >
+                          Temporal
+                        </button>
+                        <button
+                          onClick={() => setColorMode('solid')}
+                          className={`px-3 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-tight border transition-all ${
+                            colorMode === 'solid' 
+                            ? 'bg-stone-900 text-white border-stone-900 shadow-md' 
+                            : 'bg-white text-stone-600 border-stone-200 hover:border-stone-400'
+                          }`}
+                        >
+                          Solid Fill
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="space-y-2 pt-2">
                       <label className="text-[10px] font-bold text-stone-500 uppercase tracking-wider">Dot Shape</label>
                       <div className="grid grid-cols-2 gap-2">
                         {(['circle', 'square'] as const).map((shape) => (
@@ -816,12 +845,39 @@ export default function App() {
                   <div className={`w-3 h-3 rounded-${markerShape === 'circle' ? 'full' : 'sm'} bg-stone-900 shadow-sm border border-white`} />
                 </div>
                 <div className="space-y-1">
-                  <p className="text-[8px] font-bold text-stone-400 uppercase tracking-tighter">Timeline (2008 - Present)</p>
-                  <div className="h-1.5 w-full bg-gradient-to-r from-[#0000ff] via-[#00ff00] via-[#ffff00] to-[#ff0000] rounded-full shadow-inner" />
-                  <div className="flex justify-between text-[7px] font-mono text-stone-500 uppercase tracking-tighter">
-                    <span>Jan 2008</span>
-                    <span>Present</span>
-                  </div>
+                  <p className="text-[8px] font-bold text-stone-400 uppercase tracking-tighter">
+                    {colorMode === 'temporal' ? 'Timeline (2008 - Present)' : 'Species Colors'}
+                  </p>
+                  {colorMode === 'temporal' ? (
+                    <>
+                      <div className="h-1.5 w-full bg-gradient-to-r from-[#0000ff] via-[#00ff00] via-[#ffff00] to-[#ff0000] rounded-full shadow-inner" />
+                      <div className="flex justify-between text-[7px] font-mono text-stone-500 uppercase tracking-tighter">
+                        <span>Jan 2008</span>
+                        <span>Present</span>
+                      </div>
+                    </>
+                  ) : (
+                    <div className="space-y-1.5 pt-0.5">
+                      {species.includes('red') && (
+                        <div className="flex items-center gap-2">
+                          <div className="w-2 h-2 rounded-full bg-[#dc2626]" />
+                          <span className="text-[9px] font-bold text-stone-600 uppercase tracking-widest">Red Squirrel</span>
+                        </div>
+                      )}
+                      {species.includes('grey') && (
+                        <div className="flex items-center gap-2">
+                          <div className="w-2 h-2 rounded-full bg-[#78716c]" />
+                          <span className="text-[9px] font-bold text-stone-600 uppercase tracking-widest">Grey Squirrel</span>
+                        </div>
+                      )}
+                      {species.includes('marten') && (
+                        <div className="flex items-center gap-2">
+                          <div className="w-2 h-2 rounded-full bg-[#713f12]" />
+                          <span className="text-[9px] font-bold text-stone-600 uppercase tracking-widest">Pine Marten</span>
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
               </div>
 

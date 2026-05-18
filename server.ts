@@ -81,25 +81,22 @@ async function fetchAllSightings(species: 'red' | 'grey' | 'marten', forceReset:
   console.log(`[Bulk Load] Starting sync for ${species} in Scotland (Year by Year)...`);
   
   const taxonFilter = species === "red" 
-    ? `taxonConceptID:NBNSYS0000005108`
+    ? `scientificName:"Sciurus vulgaris"`
     : species === "grey" 
-      ? `taxonConceptID:NBNSYS0000005107`
-      : `taxonConceptID:NBNSYS0000005111`;
+      ? `scientificName:"Sciurus carolinensis"`
+      : `scientificName:"Martes martes"`;
   
-  const ssrsUids = ['dr382', 'dr1711', 'dr1712', 'dr1713', 'dr2140', 'dr383', 'dr659', 'dr949'];
-  const uidFilter = `(dataResourceUid:(${ssrsUids.join(' OR ')}) OR dataResourceName:"Saving Scotland's Red Squirrels"*)`;
+  const query = taxonFilter;
   
   const url = `https://records-ws.nbnatlas.org/occurrences/search`;
   const currentYear = new Date().getFullYear();
   
   // Use existing records as base for incremental update
   const existingRecords = bulkStore[species] || [];
-  const recordMap = new Map(existingRecords.map(r => [r.id, r]));
+  const recordMap = new Map(existingRecords.filter(r => r && (r.id || r.uuid)).map(r => [r.id || r.uuid, r]));
   
   try {
     // Get accurate global total first
-    // For squirrels we only care about SSRS, for marten we want everything in Scotland
-    const query = species === 'marten' ? taxonFilter : `(${taxonFilter} AND ${uidFilter})`;
     const geoFq = `decimalLatitude:[54.0 TO 62.0] AND decimalLongitude:[-11.0 TO 2.0]`;
 
     const globalCheck = await axios.get(url, {
@@ -115,7 +112,7 @@ async function fetchAllSightings(species: 'red' | 'grey' | 'marten', forceReset:
     syncStatus[species].totalEstimated = totalExpected;
     syncStatus[species].count = recordMap.size;
 
-    console.log(`[Sync] ${species}: Global check found ${totalExpected} records.`);
+    console.log(`[Sync] ${species}: Starting fetch for ${totalExpected} records.`);
 
     if (forceReset) {
       recordMap.clear();
@@ -220,20 +217,8 @@ async function fetchAllSightings(species: 'red' | 'grey' | 'marten', forceReset:
 
 const isSSRS = (s: any) => {
   if (!s) return false;
-  // Broad acceptance for Martens as per user request
-  const sciName = s.scientificName?.toLowerCase() || "";
-  const commonName = s.raw_commonName?.toLowerCase() || "";
-  if (sciName.includes("martes") || commonName.includes("marten")) {
-    return true;
-  }
-  const ssrsUids = ['dr382', 'dr1711', 'dr1712', 'dr1713', 'dr2140', 'dr383', 'dr659', 'dr949'];
-  const drName = (s.dataResourceName || "").toLowerCase();
-  
-  // Be permissive: match if it mentions "Saving Scotland's Red Squirrel" or SSRS
-  const nameMatch = drName.includes("saving scotland") || drName.includes("ssrs");
-  const uidMatch = s.dataResourceUid && ssrsUids.includes(s.dataResourceUid);
-  
-  return !!(nameMatch || uidMatch);
+  // Permissive to include all records as requested by user
+  return true;
 };
 
 async function startServer() {
@@ -280,7 +265,7 @@ async function startServer() {
   const targetSpecies = Array.isArray(species) ? species : [species];
   targetSpecies.forEach(async (s) => {
     const sKey = s as 'red' | 'grey' | 'marten';
-    if (['red', 'grey', 'marten'].includes(sKey) && (!bulkStore[sKey] || bulkStore[sKey].length === 0 || forceRefresh === 'true')) {
+    if (['red', 'grey', 'marten'].includes(sKey) && (!bulkStore[sKey] || bulkStore[sKey].length < 10 || forceRefresh === 'true')) {
       fetchAllSightings(sKey, forceRefresh === 'true'); 
     }
   });
@@ -529,11 +514,15 @@ async function startServer() {
     });
   }
 
-    // If we have no records, trigger a fresh sync in background
+    // If we have very few records or no records, trigger a fresh sync in background
     setTimeout(() => {
-      if (bulkStore.red.length === 0) fetchAllSightings('red');
-      if (bulkStore.grey.length === 0) fetchAllSightings('grey');
-      if (bulkStore.marten.length === 0) fetchAllSightings('marten');
+      ['red', 'grey', 'marten'].forEach(species => {
+        const sKey = species as 'red' | 'grey' | 'marten';
+        if (bulkStore[sKey].length < 10) {
+          console.log(`[Server] Proactive sync for ${sKey} (current count: ${bulkStore[sKey].length})`);
+          fetchAllSightings(sKey);
+        }
+      });
     }, 5000);
 
     app.listen(PORT, "0.0.0.0", () => {
