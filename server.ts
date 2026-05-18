@@ -74,59 +74,77 @@ async function fetchAllSightings(species: 'red' | 'grey' | 'marten', forceReset:
   syncStatus[species] = { 
     ...syncStatus[species],
     isLoading: true, 
-    count: 0, 
-    totalEstimated: 0, 
     phase: 'Initializing',
     currentYear: 2008
   };
   
   console.log(`[Bulk Load] Starting sync for ${species} in Scotland (Year by Year)...`);
-  const query = species === "red" 
+  
+  const taxonFilter = species === "red" 
     ? `(scientificName:"Sciurus vulgaris" OR taxonConceptID:NBNSYS0000005108 OR lsid:NHMSYS0000080188)`
     : species === "grey"
       ? `(scientificName:"Sciurus carolinensis" OR taxonConceptID:NBNSYS0000005107 OR lsid:NHMSYS0000080184)`
       : `(scientificName:"Martes martes" OR taxonConceptID:NBNSYS0000005111 OR lsid:NHMSYS0000080190)`;
   
+  const ssrsUids = ['dr382', 'dr1711', 'dr1712', 'dr1713', 'dr2140', 'dr383', 'dr659'];
+  const uidFilter = `(dataResourceUid:(${ssrsUids.join(' OR ')}) OR dataResourceName:("Saving Scotland's Red Squirrels" OR "SSRS"))`;
+  
+  // For squirrels, we ONLY want SSRS data. For Martens, we want all occurrences.
+  const query = species === 'marten' ? taxonFilter : `(${taxonFilter} AND ${uidFilter})`;
+  
   const url = `https://records-ws.nbnatlas.org/occurrences/search`;
   const currentYear = new Date().getFullYear();
-  let allRecords: any[] = [];
-  const foundSources = new Set<string>();
-
+  
+  // Use existing records as base for incremental update
+  const existingRecords = bulkStore[species] || [];
+  const recordMap = new Map(existingRecords.map(r => [r.id, r]));
+  
   try {
     // Get accurate global total first
-    const ssrsFilter = `(dataResourceUid:dr382 OR dataResourceUid:dr1711 OR dataResourceUid:dr1712 OR dataResourceUid:dr659 OR dataResourceName:"Saving Scotland's Red Squirrels"*)`;
-    
-    // For Martens, we want ALL data as requested by user, no special filter
-    const activeFilter = species === 'marten' ? 'occurrenceStatus:present' : ssrsFilter;
-
     const globalCheck = await axios.get(url, {
       params: {
         q: query,
-        fq: [`decimalLatitude:[54.0 TO 62.0]`, `decimalLongitude:[-9.0 TO 0.0]`, `year:[2008 TO ${currentYear}]`, activeFilter],
+        fq: [
+          `decimalLatitude:[54.0 TO 62.0]`,
+          `decimalLongitude:[-11.0 TO 2.0]`,
+          `year:[2008 TO ${currentYear}]`
+        ],
         pageSize: 0
       }
     });
 
-    syncStatus[species].totalEstimated = globalCheck.data.totalRecords || 0;
-    syncStatus[species].count = 0;
+    const totalExpected = globalCheck.data.totalRecords || 0;
+    syncStatus[species].totalEstimated = totalExpected;
+    syncStatus[species].count = recordMap.size;
 
-    // Reset current store for this species if force resetting
+    console.log(`[Sync] ${species}: Global check found ${totalExpected} records.`);
+
     if (forceReset) {
+      recordMap.clear();
       bulkStore[species] = [];
+      syncStatus[species].count = 0;
     }
 
-    for (let year = 2008; year <= currentYear; year++) {
+    // Sync most recent years first for immediate feedback
+    for (let year = currentYear; year >= 2008; year--) {
       syncStatus[species].currentYear = year;
       
       const yearCheck = await axios.get(url, {
         params: {
           q: query,
-          fq: [`decimalLatitude:[54.0 TO 62.0]`, `decimalLongitude:[-9.0 TO 0.0]`, `year:${year}`, activeFilter],
+          fq: [
+            `decimalLatitude:[54.0 TO 62.0]`,
+            `decimalLongitude:[-11.0 TO 2.0]`,
+            `year:[${year} TO ${year}]`
+          ],
           pageSize: 0
         }
       });
       const yearTotal = yearCheck.data.totalRecords || 0;
-      if (yearTotal === 0) continue;
+      if (yearTotal === 0) {
+        console.log(`[Sync] ${species} ${year}: 0 records, skipping.`);
+        continue;
+      }
 
       const months = yearTotal > 4500 ? [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] : [null];
 
@@ -139,11 +157,10 @@ async function fetchAllSightings(species: 'red' | 'grey' | 'marten', forceReset:
 
         const fq = [
           `decimalLatitude:[54.0 TO 62.0]`,
-          `decimalLongitude:[-9.0 TO 0.0]`,
-          `year:${year}`,
-          activeFilter
+          `decimalLongitude:[-11.0 TO 2.0]`,
+          `year:[${year} TO ${year}]`
         ];
-        if (month) fq.push(`month:${month}`);
+        if (month) fq.push(`month:[${month} TO ${month}]`);
 
         while (hasMoreInPeriod) {
           try {
@@ -153,13 +170,14 @@ async function fetchAllSightings(species: 'red' | 'grey' | 'marten', forceReset:
                 fq: fq,
                 pageSize: pageSize,
                 start: startOffset,
-                fl: "id,decimalLatitude,decimalLongitude,year,species,scientificName,raw_commonName,occurrenceDate,dataResourceName,dataResourceUid",
+                fl: "id,decimalLatitude,decimalLongitude,year,scientificName,raw_commonName,occurrenceDate,dataResourceName,dataResourceUid",
               },
-              timeout: 90000 // Increased timeout for potentially large responses
+              timeout: 60000
             });
 
-            let records = response.data.occurrences || [];
-            const totalResults = response.data.totalRecords || 0;
+            const responseData = response.data;
+            let records = responseData.occurrences || [];
+            const totalInRequest = responseData.totalRecords || 0;
             
             if (records.length === 0) {
               hasMoreInPeriod = false;
@@ -173,21 +191,31 @@ async function fetchAllSightings(species: 'red' | 'grey' | 'marten', forceReset:
               "Martes martes"
             ).toLowerCase();
             
-            // Be more permissive with name matching to avoid dropping valid records due to metadata variations
-            records = records.filter((r: any) => {
-              const rSciName = (r.scientificName || r.species || "").toLowerCase();
+            let matchedInBatch = 0;
+            records.forEach((r: any) => {
+              const rSciName = (r.scientificName || "").toLowerCase();
               const rCommonName = (r.raw_commonName || "").toLowerCase();
               const searchSpecies = species === 'marten' ? 'marten' : species;
-              return rSciName.includes(scientificNameTarget) || rCommonName.includes(searchSpecies);
+              
+              const matchesSpecies = rSciName.includes(scientificNameTarget) || 
+                                     rCommonName.includes(searchSpecies) ||
+                                     rSciName.includes("sciurus") || 
+                                     (species === 'marten' && rSciName.includes("martes"));
+
+              if (matchesSpecies && r.id) {
+                recordMap.set(r.id, r);
+                matchedInBatch++;
+              }
             });
 
-            allRecords = [...allRecords, ...records];
-            syncStatus[species].count = allRecords.length;
+            console.log(`[Sync] ${species} ${year}: Fetched ${rawFetchedCount}, Matched ${matchedInBatch}. Map size: ${recordMap.size}`);
+            syncStatus[species].count = recordMap.size;
+            bulkStore[species] = Array.from(recordMap.values());
             
-            if (rawFetchedCount < pageSize || startOffset + pageSize >= totalResults || startOffset + pageSize >= 5000) {
+            if (rawFetchedCount < pageSize || startOffset + rawFetchedCount >= totalInRequest || startOffset + rawFetchedCount >= 5000) {
               hasMoreInPeriod = false;
             } else {
-              startOffset += pageSize;
+              startOffset += rawFetchedCount;
             }
           } catch (err: any) {
             console.error(`[Bulk Load] Error at ${year}${month ? '-' + month : ''}, offset ${startOffset}:`, err.message);
@@ -198,8 +226,8 @@ async function fetchAllSightings(species: 'red' | 'grey' | 'marten', forceReset:
       }
     }
 
-    console.log(`[Bulk Load] ${species} SYNC FINISHED. total=${allRecords.length}`);
-    bulkStore[species] = allRecords;
+    console.log(`[Bulk Load] ${species} SYNC FINISHED. total=${recordMap.size}`);
+    bulkStore[species] = Array.from(recordMap.values());
     syncStatus[species].phase = 'Saving to disk';
     syncStatus[species].lastSync = new Date().toISOString();
     await saveDataToFile();
@@ -222,14 +250,22 @@ async function fetchAllSightings(species: 'red' | 'grey' | 'marten', forceReset:
 })();
 
 const isSSRS = (s: any) => {
+  if (!s) return false;
   // Broad acceptance for Martens as per user request
-  if (s.scientificName?.toLowerCase().includes("martes") || s.species?.toLowerCase().includes("martes") || s.raw_commonName?.toLowerCase().includes("marten")) {
+  const sciName = s.scientificName?.toLowerCase() || "";
+  const commonName = s.raw_commonName?.toLowerCase() || "";
+  if (sciName.includes("martes") || commonName.includes("marten")) {
     return true;
   }
   const ssrsUids = ['dr382', 'dr1711', 'dr1712', 'dr1713', 'dr2140', 'dr383', 'dr659'];
-  const nameMatch = s.dataResourceName && s.dataResourceName.includes("Saving Scotland's Red Squirrels");
+  const drName = (s.dataResourceName || "").toLowerCase();
+  
+  // Be permissive: match if it mentions "Saving Scotland's Red Squirrel" or SSRS
+  const nameMatch = drName.includes("saving scotland") && drName.includes("squirrel");
+  const ssrsAcroMatch = drName.includes("ssrs");
   const uidMatch = s.dataResourceUid && ssrsUids.includes(s.dataResourceUid);
-  return !!(nameMatch || uidMatch);
+  
+  return !!(nameMatch || ssrsAcroMatch || uidMatch);
 };
 
 async function startServer() {
@@ -246,18 +282,20 @@ async function startServer() {
     const speciesInQuery = species as string;
     const speciesKey = (['red', 'grey', 'marten'].includes(speciesInQuery) ? speciesInQuery : 'red') as 'red' | 'grey' | 'marten';
 
-    // Check if we need to trigger a load
-    if (!bulkStore[speciesKey] || bulkStore[speciesKey].length === 0 || forceRefresh === 'true') {
-      if (!bulkStore[speciesKey] || bulkStore[speciesKey].length === 0) {
-        await fetchAllSightings(speciesKey);
-      } else {
-        // Trigger background sync but don't wait for it
-        fetchAllSightings(speciesKey, forceRefresh === 'true'); 
-      }
+  // Start background sync for species immediately if needed
+  const targetSpecies = Array.isArray(species) ? species : [species];
+  targetSpecies.forEach(async (s) => {
+    const sKey = s as 'red' | 'grey' | 'marten';
+    if (['red', 'grey', 'marten'].includes(sKey) && (!bulkStore[sKey] || bulkStore[sKey].length === 0 || forceRefresh === 'true')) {
+      fetchAllSightings(sKey, forceRefresh === 'true'); 
     }
+  });
 
-    // Filter to valid records
-    let results = (bulkStore[speciesKey] || []).filter(isSSRS);
+  // Proceed with filtering current data
+  const responseSpecies = Array.isArray(species) ? species : [species];
+  const resultsBySpecies = await Promise.all(responseSpecies.map(async (s) => {
+    const sKey = (['red', 'grey', 'marten'].includes(s as string) ? s : 'red') as 'red' | 'grey' | 'marten';
+    let results = (bulkStore[sKey] || []).filter(isSSRS);
 
     // 1. Time Filter
     if (startYear || endYear) {
@@ -278,9 +316,12 @@ async function startServer() {
         return lat >= l1 && lat <= l2 && lon >= ln1 && lon <= ln2;
       });
     }
+    return results;
+  }));
 
-    const totalCountInBounds = results.length;
-    const currentZoom = parseInt(zoom as string) || 10;
+  let results = resultsBySpecies.flat();
+  const totalCountInBounds = results.length;
+  const currentZoom = parseInt(zoom as string) || 10;
     
     // 3. Thinning Logic
     // If zoomed in (e.g. village level) or if few records, don't thin

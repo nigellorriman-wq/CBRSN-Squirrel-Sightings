@@ -180,10 +180,21 @@ export default function App() {
     setSightings([]); // Clear results immediately when parameters change to avoid stale 'No sightings' or markers
   }, [species, startYear, endYear]);
 
+  const [syncTick, setSyncTick] = useState(0);
+
+  useEffect(() => {
+    let timer: any;
+    if (isSyncing) {
+      timer = setInterval(() => {
+        setSyncTick(t => t + 1);
+      }, 10000); // Pulse data update every 10s during sync
+    }
+    return () => clearInterval(timer);
+  }, [isSyncing]);
+
   useEffect(() => {
     async function fetchData() {
       setLoading(true);
-      setSightings([]); // Clear existing results immediately to prevent stale 'No sightings' overlay
       try {
         const results = await Promise.all(species.map(async (s) => {
           const query = new URLSearchParams({
@@ -209,7 +220,7 @@ export default function App() {
         const merged = results.flat();
         setSightings(merged);
         setTotalRecords(merged.length);
-        setIsThinned(merged.length > 5000); // Simple thinning heuristic for merged set
+        setIsThinned(merged.length > 5000);
       } catch (error) {
         console.error('Fetch error:', error);
       } finally {
@@ -217,7 +228,7 @@ export default function App() {
       }
     }
     fetchData();
-  }, [species, debouncedRange.start, debouncedRange.end, debouncedBounds, mapZoom]);
+  }, [species, debouncedRange.start, debouncedRange.end, debouncedBounds, mapZoom, isSyncing, syncTick]);
 
   useEffect(() => {
     async function fetchStats() {
@@ -262,12 +273,16 @@ export default function App() {
           const martenLoading = data.marten?.isLoading || false;
           const currentlyLoading = redLoading || greyLoading || martenLoading;
           
-          // Update progress for selected species (take first one as representative)
-          if (species.length > 0 && data[species[0]]) {
-            setSyncProgress(data[species[0]]);
-          } else {
-            setSyncProgress(null);
-          }
+          // Update progress for all species (aggregate)
+          const activeS = data.red?.isLoading ? data.red : (data.grey?.isLoading ? data.grey : data.marten);
+          const aggregateProgress = {
+            count: (data.red?.count || 0) + (data.grey?.count || 0) + (data.marten?.count || 0),
+            totalEstimated: (data.red?.totalEstimated || 0) + (data.grey?.totalEstimated || 0) + (data.marten?.totalEstimated || 0),
+            isLoading: currentlyLoading,
+            phase: activeS?.phase || 'idle',
+            currentYear: activeS?.currentYear
+          };
+          setSyncProgress(aggregateProgress as any);
           
           setIsSyncing(currentlyLoading);
         }
