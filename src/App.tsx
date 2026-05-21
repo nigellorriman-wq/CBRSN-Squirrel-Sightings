@@ -393,10 +393,20 @@ export default function App() {
           const currentlyLoading = redLoading || greyLoading || martenLoading || greyTrappingLoading;
           
           let activeS = null;
-          if (redLoading) activeS = data.red;
-          else if (greyLoading) activeS = data.grey;
-          else if (martenLoading) activeS = data.marten;
-          else if (greyTrappingLoading) activeS = data.grey_trapping;
+          let activeSpeciesName = "";
+          if (redLoading) {
+            activeS = data.red;
+            activeSpeciesName = "Red Squirrels";
+          } else if (greyLoading) {
+            activeS = data.grey;
+            activeSpeciesName = "Grey Squirrels";
+          } else if (martenLoading) {
+            activeS = data.marten;
+            activeSpeciesName = "Pine Martens";
+          } else if (greyTrappingLoading) {
+            activeS = data.grey_trapping;
+            activeSpeciesName = "Grey Trapping";
+          }
 
           if (activeS) {
             const aggregateProgress = {
@@ -404,7 +414,8 @@ export default function App() {
               totalEstimated: (data.red?.totalEstimated || 0) + (data.grey?.totalEstimated || 0) + (data.marten?.totalEstimated || 0) + (data.grey_trapping?.totalEstimated || 0),
               isLoading: true,
               phase: activeS.phase,
-              currentYear: activeS.currentYear
+              currentYear: activeS.currentYear,
+              speciesName: activeSpeciesName
             };
             setSyncProgress(aggregateProgress);
           } else {

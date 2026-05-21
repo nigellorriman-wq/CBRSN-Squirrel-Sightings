@@ -375,36 +375,46 @@ async function fetchAllSightings(species: 'red' | 'grey' | 'marten' | 'grey_trap
     console.log(`[Sync] ${species}: Found ${totalExpected} records in total search.`);
 
     if (forceReset) {
-      if (syncProgressStore[species]?.isComplete) {
-        // It was fully complete previously. This is a brand new request to fully refresh.
-        console.log(`[Sync] ${species} was fully complete previously. Wiping and starting fresh.`);
-        syncProgressStore[species].completedYears = [];
-        syncProgressStore[species].isComplete = false;
-        await saveProgressToFile();
-        
-        recordMap.clear();
-        bulkStore[species] = [];
-        syncStatus[species].count = 0;
-      } else {
-        // Resume incomplete/stalled download! Keep years already marked as completed.
-        const completedYears = syncProgressStore[species]?.completedYears || [];
-        if (completedYears.length === 0) {
-          recordMap.clear();
-          bulkStore[species] = [];
-          syncStatus[species].count = 0;
-        } else {
-          const completedYearsSet = new Set(completedYears.map(Number));
-          const filteredRecords = existingRecords.filter(r => r && completedYearsSet.has(Number(r.year)));
-          recordMap.clear();
-          filteredRecords.forEach((r: any) => {
-            const recordId = r.uuid || r.id;
-            if (recordId) recordMap.set(recordId, r);
-          });
-          bulkStore[species] = filteredRecords;
-          syncStatus[species].count = recordMap.size;
-          console.log(`[Sync] Resuming incomplete ${species} sync with ${completedYears.length} completed years. Retained ${recordMap.size} records.`);
+      console.log(`[Sync] ${species}: Force reset was requested. Wiping sync progress, clearing in-memory data, and deleting all year-split JSON files.`);
+      
+      // 1. Delete all existing year-split files from year 2000 to currentYear
+      for (let y = 2000; y <= currentYear; y++) {
+        const yearFilePath = getSpeciesYearFilePath(species, y);
+        try {
+          if (existsSync(yearFilePath)) {
+            await fs.unlink(yearFilePath);
+            console.log(`[Sync] Deleted split file: ${yearFilePath}`);
+          }
+        } catch (unlinkErr) {
+          console.error(`[Sync] Failed to delete split file ${yearFilePath}:`, unlinkErr);
         }
       }
+
+      // Also try to delete legacy master file to avoid any bootstrap loading corrupt data
+      const legacyFilePath = getSpeciesFilePath(species);
+      try {
+        if (existsSync(legacyFilePath)) {
+          await fs.unlink(legacyFilePath);
+          console.log(`[Sync] Deleted legacy master file: ${legacyFilePath}`);
+        }
+      } catch (err) {}
+
+      // 2. Reset progress store
+      syncProgressStore[species] = {
+        count: 0,
+        lastSync: null,
+        completedYears: [],
+        isComplete: false
+      };
+      await saveProgressToFile();
+
+      // 3. Reset local memory & maps
+      recordMap.clear();
+      bulkStore[species] = [];
+      syncStatus[species].count = 0;
+      syncStatus[species].lastSync = null;
+      syncStatus[species].currentYear = currentYear;
+      syncStatus[species].phase = 'Starting Fresh';
     }
 
     // Sync from year 2000 to current
