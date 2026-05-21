@@ -969,37 +969,62 @@ export default function App() {
                       </div>
                     )}
                     
-                    <ResponsiveContainer width="100%" height="100%">
-                      <LineChart data={populationTimeline} margin={{ top: 5, right: 5, left: -20, bottom: 0 }}>
-                        <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e7e5e4" />
-                        <XAxis 
-                          dataKey="year" 
-                          fontSize={9} 
-                          tickLine={false} 
-                          axisLine={false} 
-                          tick={{ fill: '#a8a29e' }}
-                        />
-                        <YAxis 
-                          fontSize={9} 
-                          tickLine={false} 
-                          axisLine={false} 
-                          tick={{ fill: '#a8a29e' }}
-                        />
-                        <ChartTooltip 
-                          contentStyle={{ 
-                            fontSize: '10px', 
-                            borderRadius: '8px', 
-                            border: 'none', 
-                            boxShadow: '0 4px 12px rgba(0,0,0,0.1)',
-                            padding: '8px'
-                          }} 
-                        />
-                        <Line type="monotone" dataKey="red" stroke="#ef4444" strokeWidth={2} dot={{ r: 2 }} activeDot={{ r: 4 }} />
-                        <Line type="monotone" dataKey="grey" stroke="#78716c" strokeWidth={2} dot={{ r: 2 }} activeDot={{ r: 4 }} />
-                        <Line type="monotone" dataKey="grey_effort" stroke="#eab308" strokeWidth={2} strokeDasharray="5 5" dot={{ r: 2 }} activeDot={{ r: 4 }} />
-                        <Line type="monotone" dataKey="marten" stroke="#713f12" strokeWidth={2} dot={{ r: 2 }} activeDot={{ r: 4 }} />
-                      </LineChart>
-                    </ResponsiveContainer>
+                    {(() => {
+                      const chartTimelineData = populationTimeline.map((item) => ({
+                        ...item,
+                        _orig_red: item.red,
+                        _orig_grey: item.grey,
+                        _orig_grey_effort: item.grey_effort,
+                        _orig_marten: item.marten,
+                        red: item.red > 0 ? item.red : 1,
+                        grey: item.grey > 0 ? item.grey : 1,
+                        grey_effort: item.grey_effort > 0 ? item.grey_effort : 1,
+                        marten: (item.marten || 0) > 0 ? item.marten : 1,
+                      }));
+                      return (
+                        <ResponsiveContainer width="100%" height="100%">
+                          <LineChart data={chartTimelineData} margin={{ top: 5, right: 5, left: -20, bottom: 0 }}>
+                            <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e7e5e4" />
+                            <XAxis 
+                              dataKey="year" 
+                              fontSize={9} 
+                              tickLine={false} 
+                              axisLine={false} 
+                              tick={{ fill: '#a8a29e' }}
+                            />
+                            <YAxis 
+                              scale="log"
+                              domain={[1, 'auto']}
+                              allowDataOverflow={true}
+                              fontSize={9} 
+                              tickLine={false} 
+                              axisLine={false} 
+                              tick={{ fill: '#a8a29e' }}
+                              tickFormatter={(val) => val.toLocaleString()}
+                            />
+                            <ChartTooltip 
+                              contentStyle={{ 
+                                fontSize: '10px', 
+                                borderRadius: '8px', 
+                                border: 'none', 
+                                boxShadow: '0 4px 12px rgba(0,0,0,0.1)',
+                                padding: '8px'
+                              }} 
+                              formatter={(value: any, name: any, entry: any) => {
+                                const key = entry.dataKey;
+                                const originalValue = entry.payload[`_orig_${key}`];
+                                const displayVal = originalValue !== undefined ? originalValue : value;
+                                return [displayVal.toLocaleString(), name];
+                              }}
+                            />
+                            <Line type="monotone" dataKey="red" name="Red" stroke="#ef4444" strokeWidth={2} dot={{ r: 2 }} activeDot={{ r: 4 }} />
+                            <Line type="monotone" dataKey="grey" name="Grey" stroke="#78716c" strokeWidth={2} dot={{ r: 2 }} activeDot={{ r: 4 }} />
+                            <Line type="monotone" dataKey="grey_effort" name="Grey Trapping" stroke="#eab308" strokeWidth={2} strokeDasharray="5 5" dot={{ r: 2 }} activeDot={{ r: 4 }} />
+                            <Line type="monotone" dataKey="marten" name="Marten" stroke="#713f12" strokeWidth={2} dot={{ r: 2 }} activeDot={{ r: 4 }} />
+                          </LineChart>
+                        </ResponsiveContainer>
+                      );
+                    })()}
                   </div>
                   
                   <div className="grid grid-cols-4 gap-2 px-1 text-center">
@@ -1016,7 +1041,7 @@ export default function App() {
                       </span>
                     </div>
                     <div className="flex flex-col">
-                      <span className="text-[8px] text-stone-400 font-bold uppercase tracking-wider">Effort</span>
+                      <span className="text-[8px] text-stone-400 font-bold uppercase tracking-wider">Grey Trapping</span>
                       <span className="text-xs font-bold text-yellow-600">
                         {populationTimeline.reduce((sum, d) => sum + d.grey_effort, 0).toLocaleString()}
                       </span>

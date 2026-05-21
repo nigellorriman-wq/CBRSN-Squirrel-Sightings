@@ -177,9 +177,10 @@ async function ensureSpeciesLoaded(species: 'red' | 'grey' | 'marten' | 'grey_tr
         }
         console.log(`[Persistence] Loaded wrapped ${parsed.records.length} records for ${species} on-demand. downloadedAt=${parsed.downloadedAt}`);
       }
-    } else if (existsSync(DATA_FILE)) {
-      console.log(`[Persistence] Split file ${filePath} not found. Attempting bootstrap from ${DATA_FILE}...`);
-      const data = await fs.readFile(DATA_FILE, 'utf-8');
+    } else if (existsSync(DATA_FILE) || existsSync(path.join(process.cwd(), "squirrel_sightings.json"))) {
+      const activeDataFile = existsSync(DATA_FILE) ? DATA_FILE : path.join(process.cwd(), "squirrel_sightings.json");
+      console.log(`[Persistence] Split file ${filePath} not found. Attempting bootstrap from ${activeDataFile}...`);
+      const data = await fs.readFile(activeDataFile, 'utf-8');
       const parsed = JSON.parse(data);
       if (parsed && typeof parsed === 'object') {
         const tsNow = new Date().toISOString();
@@ -857,6 +858,11 @@ async function startServer() {
     try {
       const { latMin, latMax, lonMin, lonMax, startYear, endYear, groupName } = req.query;
       
+      await ensureSpeciesLoaded('red');
+      await ensureSpeciesLoaded('grey');
+      await ensureSpeciesLoaded('marten');
+      await ensureSpeciesLoaded('grey_trapping');
+
       const currentYear = new Date().getFullYear();
       let start = parseInt(startYear as string) || 2008;
       let end = parseInt(endYear as string) || currentYear;
@@ -904,7 +910,12 @@ async function startServer() {
         const actualSp = getActualSpecies(s);
         if (actualSp === 'grey' && stats[s.year]) {
           stats[s.year].grey++;
-          if (s.isTrapping) stats[s.year].grey_effort++;
+        }
+      });
+      bulkStore.grey_trapping.filter(filterInBounds).forEach(s => {
+        const actualSp = getActualSpecies(s);
+        if (actualSp === 'grey' && stats[s.year]) {
+          stats[s.year].grey_effort++;
         }
       });
       bulkStore.marten.filter(filterInBounds).forEach(s => {
