@@ -77,6 +77,10 @@ function getSpeciesFilePath(species: string) {
   return path.join(DATA_DIR, `${species}.json`);
 }
 
+function getSpeciesYearFilePath(species: string, year: number) {
+  return path.join(DATA_DIR, `${species}_${year}.json`);
+}
+
 async function ensureDataDir() {
   if (!existsSync(DATA_DIR)) {
     await fs.mkdir(DATA_DIR, { recursive: true });
@@ -118,18 +122,47 @@ async function loadProgressFromFile() {
   }
 }
 
+async function saveSpeciesYearToFile(species: 'red' | 'grey' | 'marten' | 'grey_trapping', year: number, records: any[]) {
+  try {
+    await ensureDataDir();
+    const filePath = getSpeciesYearFilePath(species, year);
+    const tsNow = new Date().toISOString();
+    const wrapper = {
+      downloadedAt: tsNow,
+      year: year,
+      records: records
+    };
+    await fs.writeFile(filePath, JSON.stringify(wrapper, null, 2));
+    console.log(`[Persistence] Saved ${records.length} records to ${filePath}`);
+  } catch (error) {
+    console.error(`[Persistence] Error saving ${species} for year ${year}:`, error);
+  }
+}
+
 async function saveSpeciesToFile(species: 'red' | 'grey' | 'marten' | 'grey_trapping') {
   try {
     await ensureDataDir();
-    const filePath = getSpeciesFilePath(species);
     const dataToSave = bulkStore[species] || [];
+    
+    // Split the dataToSave by year and write separate files for each year
+    const recordsByYear: Record<number, any[]> = {};
+    for (const r of dataToSave) {
+      if (!r) continue;
+      const y = parseInt(r.year) || 2000;
+      if (!recordsByYear[y]) recordsByYear[y] = [];
+      recordsByYear[y].push(r);
+    }
+
+    const currentYear = new Date().getFullYear();
+    // Save each year that has records, or if it's the current year
+    for (let year = 2000; year <= currentYear; year++) {
+      const yearRecords = recordsByYear[year] || [];
+      if (yearRecords.length > 0 || year === currentYear || existsSync(getSpeciesYearFilePath(species, year))) {
+        await saveSpeciesYearToFile(species, year, yearRecords);
+      }
+    }
+
     const tsNow = syncStatus[species]?.lastSync || new Date().toISOString();
-    const wrapper = {
-      downloadedAt: tsNow,
-      records: dataToSave
-    };
-    await fs.writeFile(filePath, JSON.stringify(wrapper, null, 2));
-    console.log(`[Persistence] Saved ${dataToSave.length} records to ${filePath} with downloadedAt=${tsNow}`);
     
     // Save count to progress store to stay aligned
     syncProgressStore[species].count = dataToSave.length;
@@ -156,30 +189,65 @@ async function ensureSpeciesLoaded(species: 'red' | 'grey' | 'marten' | 'grey_tr
     return; // Already loaded in memory cache
   }
   
+  await ensureDataDir();
+  const currentYear = new Date().getFullYear();
+  let allRecords: any[] = [];
+  let foundAnyYearFiles = false;
+
+  for (let year = 2000; year <= currentYear; year++) {
+    const yearFilePath = getSpeciesYearFilePath(species, year);
+    if (existsSync(yearFilePath)) {
+      try {
+        const data = await fs.readFile(yearFilePath, 'utf-8');
+        const parsed = JSON.parse(data);
+        if (parsed && typeof parsed === 'object' && Array.isArray(parsed.records)) {
+          allRecords = allRecords.concat(parsed.records);
+          foundAnyYearFiles = true;
+          if (parsed.downloadedAt) {
+            if (!syncStatus[species].lastSync || parsed.downloadedAt > syncStatus[species].lastSync) {
+              syncStatus[species].lastSync = parsed.downloadedAt;
+            }
+          }
+        }
+      } catch (err) {
+        console.error(`[Persistence] Error reading separate year file ${yearFilePath}:`, err);
+      }
+    }
+  }
+
+  if (foundAnyYearFiles) {
+    // Unique list to make absolutely sure no duplicates are loaded
+    const uniqueMap = new Map();
+    allRecords.forEach(r => {
+      const rid = r.uuid || r.id;
+      if (rid) uniqueMap.set(rid, r);
+    });
+    const dedupedRecords = Array.from(uniqueMap.values());
+    bulkStore[species] = dedupedRecords;
+    syncStatus[species].count = dedupedRecords.length;
+    console.log(`[Persistence] Loaded ${dedupedRecords.length} records for ${species} from separate year files.`);
+    return;
+  }
+
+  // Fallback to legacy master file /data/species.json, or base backup squirrel_sightings.json
   const filePath = getSpeciesFilePath(species);
   try {
+    let records: any[] = [];
     if (existsSync(filePath)) {
-      console.log(`[Persistence] Loading ${species} on-demand from ${filePath}...`);
+      console.log(`[Persistence] Loading ${species} on-demand from master file ${filePath} with on-demand migration...`);
       const data = await fs.readFile(filePath, 'utf-8');
       const parsed = JSON.parse(data);
       if (Array.isArray(parsed)) {
-        bulkStore[species] = parsed;
-        syncStatus[species].count = parsed.length;
-        console.log(`[Persistence] Loaded raw array of ${parsed.length} records for ${species} on-demand.`);
+        records = parsed;
       } else if (parsed && typeof parsed === 'object' && Array.isArray(parsed.records)) {
-        bulkStore[species] = parsed.records;
-        syncStatus[species].count = parsed.records.length;
+        records = parsed.records;
         if (parsed.downloadedAt) {
           syncStatus[species].lastSync = parsed.downloadedAt;
-          if (syncProgressStore[species]) {
-            syncProgressStore[species].lastSync = parsed.downloadedAt;
-          }
         }
-        console.log(`[Persistence] Loaded wrapped ${parsed.records.length} records for ${species} on-demand. downloadedAt=${parsed.downloadedAt}`);
       }
     } else if (existsSync(DATA_FILE) || existsSync(path.join(process.cwd(), "squirrel_sightings.json"))) {
       const activeDataFile = existsSync(DATA_FILE) ? DATA_FILE : path.join(process.cwd(), "squirrel_sightings.json");
-      console.log(`[Persistence] Split file ${filePath} not found. Attempting bootstrap from ${activeDataFile}...`);
+      console.log(`[Persistence] Split and legacy files not found. Bootstrapping species ${species} from ${activeDataFile}...`);
       const data = await fs.readFile(activeDataFile, 'utf-8');
       const parsed = JSON.parse(data);
       if (parsed && typeof parsed === 'object') {
@@ -187,50 +255,38 @@ async function ensureSpeciesLoaded(species: 'red' | 'grey' | 'marten' | 'grey_tr
         if (species === 'grey_trapping') {
           let rawGreyList = Array.isArray(parsed.grey) ? parsed.grey : [];
           rawGreyList.forEach(isSSRS);
-          let records = rawGreyList.filter(r => r.isTrapping);
-          bulkStore.grey_trapping = records;
-          
-          const wrapper = {
-            downloadedAt: tsNow,
-            records: records
-          };
-          await fs.writeFile(filePath, JSON.stringify(wrapper, null, 2));
-          syncStatus.grey_trapping.count = records.length;
-          syncStatus.grey_trapping.lastSync = tsNow;
-          
-          if (syncProgressStore.grey_trapping) {
-            syncProgressStore.grey_trapping.count = records.length;
-            syncProgressStore.grey_trapping.lastSync = tsNow;
-          }
-          console.log(`[Persistence] Bootstrapped grey_trapping with ${records.length} records.`);
+          records = rawGreyList.filter(r => r.isTrapping);
         } else {
           let rawList = Array.isArray(parsed[species]) ? parsed[species] : [];
           rawList.forEach(isSSRS);
-          let records = rawList;
+          records = rawList;
           if (species === 'grey') {
             records = rawList.filter(r => !r.isTrapping);
           }
-          bulkStore[species] = records;
-          
-          const wrapper = {
-            downloadedAt: tsNow,
-            records: records
-          };
-          await fs.writeFile(filePath, JSON.stringify(wrapper, null, 2));
-          syncStatus[species].count = records.length;
-          syncStatus[species].lastSync = tsNow;
-          
-          if (syncProgressStore[species]) {
-            syncProgressStore[species].count = records.length;
-            syncProgressStore[species].lastSync = tsNow;
-          }
-          console.log(`[Persistence] Bootstrapped ${species} with ${records.length} records.`);
         }
-        await saveProgressToFile();
+        syncStatus[species].lastSync = tsNow;
       }
     }
+
+    if (records.length > 0) {
+      // Migrate loaded records to separate year files immediately!
+      console.log(`[Persistence] Migrating ${records.length} bootstrapped records of ${species} to separate year files...`);
+      const recordsByYear: Record<number, any[]> = {};
+      for (const r of records) {
+        const y = parseInt(r.year) || 2000;
+        if (!recordsByYear[y]) recordsByYear[y] = [];
+        recordsByYear[y].push(r);
+      }
+      for (const [yearStr, yearRecords] of Object.entries(recordsByYear)) {
+        const y = parseInt(yearStr);
+        await saveSpeciesYearToFile(species, y, yearRecords);
+      }
+      bulkStore[species] = records;
+      syncStatus[species].count = records.length;
+      await saveProgressToFile();
+    }
   } catch (error) {
-    console.error(`[Persistence] Error loading ${species} on-demand:`, error);
+    console.error(`[Persistence] Error bootstrapping ${species} on-demand:`, error);
   }
 }
 
@@ -342,9 +398,28 @@ async function fetchAllSightings(species: 'red' | 'grey' | 'marten' | 'grey_trap
 
     // Sync from year 2000 to current
     for (let year = currentYear; year >= 2000; year--) {
-      if (syncProgressStore[species]?.completedYears?.includes(year)) {
-        console.log(`[Sync] ${species} ${year} already completed in previous attempt. Skipping.`);
-        continue;
+      // If we are NOT on the current year, and a file for this year already exists in the data directory, we ignore/skip it!
+      if (year < currentYear) {
+        const yearFilePath = getSpeciesYearFilePath(species, year);
+        if (existsSync(yearFilePath)) {
+          console.log(`[Sync] ${species} ${year} already exists in data folder as split JSON. Skipping download.`);
+          if (!syncProgressStore[species].completedYears) {
+            syncProgressStore[species].completedYears = [];
+          }
+          if (!syncProgressStore[species].completedYears.includes(year)) {
+            syncProgressStore[species].completedYears.push(year);
+          }
+          continue;
+        }
+      }
+
+      // If it's the current year, we always fetch it in full. Clear existing records for currentYear from recordMap first to avoid duplicates.
+      if (year === currentYear) {
+        for (const [key, val] of recordMap.entries()) {
+          if (val && Number(val.year) === currentYear) {
+            recordMap.delete(key);
+          }
+        }
       }
       
       syncStatus[species].currentYear = year;
@@ -370,17 +445,17 @@ async function fetchAllSightings(species: 'red' | 'grey' | 'marten' | 'grey_trap
       if (yearTotal > 0 && !yearHasError) {
         // If more than 4000 records in a year, fetch month by month to stay under NBN's 10k limit per export
         const months = yearTotal > 4000 ? [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] : [null];
-
+ 
         for (const month of months) {
           if (yearHasError) break;
-          syncStatus[species].phase = `Fetching ${year}${month ? '-' + month : ''}`;
+          syncStatus[species].phase = `Downloading ${year}${month ? '-' + month : ''}`;
           
           let startOffset = 0;
           const pageSize = 1000;
           let hasMoreInPeriod = true;
-
+ 
           const periodFq = `${geoFq} AND ${statusFq} AND year:${year}${month ? ' AND month:' + month : ''}`;
-
+ 
           while (hasMoreInPeriod) {
             try {
               const response = await axios.get(url, {
@@ -393,7 +468,7 @@ async function fetchAllSightings(species: 'red' | 'grey' | 'marten' | 'grey_trap
                 },
                 timeout: 30000
               });
-
+ 
               const responseData = response.data;
               let records = responseData.occurrences || [];
               const totalInRequest = responseData.totalRecords || 0;
@@ -402,7 +477,7 @@ async function fetchAllSightings(species: 'red' | 'grey' | 'marten' | 'grey_trap
                  hasMoreInPeriod = false;
                  continue;
               }
-
+ 
               const rawFetchedCount = records.length;
               records.forEach((r: any) => {
                 const recordId = r.uuid || r.id;
@@ -412,12 +487,12 @@ async function fetchAllSightings(species: 'red' | 'grey' | 'marten' | 'grey_trap
                   // Filter based on species requested and trapping status
                   if (species === 'grey' && r.isTrapping) return;
                   if (species === 'grey_trapping' && !r.isTrapping) return;
-
+ 
                   recordMap.set(recordId, r);
                   r.id = recordId;
                 }
               });
-
+ 
               syncStatus[species].count = recordMap.size;
               // Immediate update to store for visibility
               bulkStore[species] = Array.from(recordMap.values());
@@ -436,7 +511,7 @@ async function fetchAllSightings(species: 'red' | 'grey' | 'marten' | 'grey_trap
           }
         }
       }
-
+ 
       if (!yearHasError) {
         if (!syncProgressStore[species].completedYears) {
           syncProgressStore[species].completedYears = [];
@@ -446,23 +521,35 @@ async function fetchAllSightings(species: 'red' | 'grey' | 'marten' | 'grey_trap
         }
         await saveProgressToFile();
         
-        // Save progress to disk for every year to ensure no data loss even if sync is interrupted or stalls
-        await saveDataToFile(species);
+        // Save ONLY the records of this year to its corresponding year file!
+        const yearRecords = Array.from(recordMap.values()).filter((r: any) => r && Number(r.year) === year);
+        
+        // Inform user on UI about saving this year's file
+        const savedFilename = `${species}_${year}.json`;
+        syncStatus[species].phase = `Saving ${savedFilename}`;
+        await new Promise(r => setTimeout(r, 600)); // Brief sleep so the UI registers this event
+        
+        await saveSpeciesYearToFile(species, year, yearRecords);
+        
+        // Maintain local bulk store alignment
+        bulkStore[species] = Array.from(recordMap.values());
+        syncStatus[species].count = recordMap.size;
+        syncStatus[species].lastSync = new Date().toISOString();
       } else {
         console.warn(`[Sync] ${species} ${year} had fetch errors, not marking as complete.`);
       }
     }
-
+ 
     console.log(`[Bulk Load] ${species} SYNC FINISHED. total=${recordMap.size}`);
     bulkStore[species] = Array.from(recordMap.values());
-    syncStatus[species].phase = 'Saving to disk';
+    syncStatus[species].phase = 'Saving final state';
     syncStatus[species].lastSync = new Date().toISOString();
     
     // Set isComplete to true and save progress!
     syncProgressStore[species].isComplete = true;
     syncProgressStore[species].lastSync = syncStatus[species].lastSync;
     await saveProgressToFile();
-
+ 
     await saveDataToFile(species);
     syncStatus[species].phase = 'Complete';
   } catch (error) {
