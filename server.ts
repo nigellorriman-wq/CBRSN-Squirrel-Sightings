@@ -167,9 +167,61 @@ async function ensureSpeciesLoaded(species: 'red' | 'grey' | 'marten' | 'grey_tr
         syncStatus[species].count = parsed.records.length;
         if (parsed.downloadedAt) {
           syncStatus[species].lastSync = parsed.downloadedAt;
-          syncProgressStore[species].lastSync = parsed.downloadedAt;
+          if (syncProgressStore[species]) {
+            syncProgressStore[species].lastSync = parsed.downloadedAt;
+          }
         }
         console.log(`[Persistence] Loaded wrapped ${parsed.records.length} records for ${species} on-demand. downloadedAt=${parsed.downloadedAt}`);
+      }
+    } else if (existsSync(DATA_FILE)) {
+      console.log(`[Persistence] Split file ${filePath} not found. Attempting bootstrap from ${DATA_FILE}...`);
+      const data = await fs.readFile(DATA_FILE, 'utf-8');
+      const parsed = JSON.parse(data);
+      if (parsed && typeof parsed === 'object') {
+        const tsNow = new Date().toISOString();
+        if (species === 'grey_trapping') {
+          let rawGreyList = Array.isArray(parsed.grey) ? parsed.grey : [];
+          rawGreyList.forEach(isSSRS);
+          let records = rawGreyList.filter(r => r.isTrapping);
+          bulkStore.grey_trapping = records;
+          
+          const wrapper = {
+            downloadedAt: tsNow,
+            records: records
+          };
+          await fs.writeFile(filePath, JSON.stringify(wrapper, null, 2));
+          syncStatus.grey_trapping.count = records.length;
+          syncStatus.grey_trapping.lastSync = tsNow;
+          
+          if (syncProgressStore.grey_trapping) {
+            syncProgressStore.grey_trapping.count = records.length;
+            syncProgressStore.grey_trapping.lastSync = tsNow;
+          }
+          console.log(`[Persistence] Bootstrapped grey_trapping with ${records.length} records.`);
+        } else {
+          let rawList = Array.isArray(parsed[species]) ? parsed[species] : [];
+          rawList.forEach(isSSRS);
+          let records = rawList;
+          if (species === 'grey') {
+            records = rawList.filter(r => !r.isTrapping);
+          }
+          bulkStore[species] = records;
+          
+          const wrapper = {
+            downloadedAt: tsNow,
+            records: records
+          };
+          await fs.writeFile(filePath, JSON.stringify(wrapper, null, 2));
+          syncStatus[species].count = records.length;
+          syncStatus[species].lastSync = tsNow;
+          
+          if (syncProgressStore[species]) {
+            syncProgressStore[species].count = records.length;
+            syncProgressStore[species].lastSync = tsNow;
+          }
+          console.log(`[Persistence] Bootstrapped ${species} with ${records.length} records.`);
+        }
+        await saveProgressToFile();
       }
     }
   } catch (error) {
@@ -419,7 +471,7 @@ async function fetchAllSightings(species: 'red' | 'grey' | 'marten' | 'grey_trap
 // Start initial background sync and load from file - moved inside startServer
 // (async () => { ... })();
 
-const getActualSpecies = (s: any): "red" | "grey" | "marten" | "other" => {
+function getActualSpecies(s: any): "red" | "grey" | "marten" | "other" {
   if (!s) return "other";
   const sciName = String(s.scientificName || s.species || "").toLowerCase();
   const commonName = String(s.raw_commonName || s.vernacularName || "").toLowerCase();
@@ -438,9 +490,9 @@ const getActualSpecies = (s: any): "red" | "grey" | "marten" | "other" => {
     return "marten";
   }
   return "other";
-};
+}
 
-const isSSRS = (s: any) => {
+function isSSRS(s: any): boolean {
   try {
     if (!s) return false;
     
@@ -538,7 +590,7 @@ const isSSRS = (s: any) => {
     }
   }
   return true;
-};
+}
 
 // Sequential Serialization Queue to prevent race conditions & write corruption
 let syncQueue: { species: 'red' | 'grey' | 'marten' | 'grey_trapping'; forceReset: boolean }[] = [];
