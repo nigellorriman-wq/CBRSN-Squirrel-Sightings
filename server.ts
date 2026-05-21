@@ -90,7 +90,9 @@ async function ensureDataDir() {
 async function saveProgressToFile() {
   try {
     await ensureDataDir();
-    await fs.writeFile(PROGRESS_FILE, JSON.stringify(syncProgressStore, null, 2));
+    const tempFile = `${PROGRESS_FILE}.tmp`;
+    await fs.writeFile(tempFile, JSON.stringify(syncProgressStore, null, 2));
+    await fs.rename(tempFile, PROGRESS_FILE);
     console.log(`[Persistence] Sync progress saved to ${PROGRESS_FILE}`);
   } catch (error) {
     console.error(`[Persistence] Error saving progress:`, error);
@@ -119,6 +121,8 @@ async function loadProgressFromFile() {
     console.log(`[Persistence] Loaded sync progress from disk. Completed years count: red=${syncProgressStore.red.completedYears.length}, grey=${syncProgressStore.grey.completedYears.length}, marten=${syncProgressStore.marten.completedYears.length}, grey_trapping=${syncProgressStore.grey_trapping.completedYears.length}`);
   } catch (err) {
     console.error("[Persistence] Error loading progress file:", err);
+    console.warn("[Persistence] PROGRESS_FILE is corrupted; resetting progress.");
+    await fs.unlink(PROGRESS_FILE).catch(() => {});
   }
 }
 
@@ -126,13 +130,15 @@ async function saveSpeciesYearToFile(species: 'red' | 'grey' | 'marten' | 'grey_
   try {
     await ensureDataDir();
     const filePath = getSpeciesYearFilePath(species, year);
+    const tempFilePath = `${filePath}.tmp`;
     const tsNow = new Date().toISOString();
     const wrapper = {
       downloadedAt: tsNow,
       year: year,
       records: records
     };
-    await fs.writeFile(filePath, JSON.stringify(wrapper, null, 2));
+    await fs.writeFile(tempFilePath, JSON.stringify(wrapper, null, 2));
+    await fs.rename(tempFilePath, filePath);
     console.log(`[Persistence] Saved ${records.length} records to ${filePath}`);
   } catch (error) {
     console.error(`[Persistence] Error saving ${species} for year ${year}:`, error);
@@ -208,9 +214,14 @@ async function ensureSpeciesLoaded(species: 'red' | 'grey' | 'marten' | 'grey_tr
               syncStatus[species].lastSync = parsed.downloadedAt;
             }
           }
+        } else {
+          console.warn(`[Persistence] Invalid structure in separate year file ${yearFilePath}. Deleting corrupt file.`);
+          await fs.unlink(yearFilePath).catch(() => {});
         }
       } catch (err) {
         console.error(`[Persistence] Error reading separate year file ${yearFilePath}:`, err);
+        console.warn(`[Persistence] Deleting corrupt separate year file ${yearFilePath} to trigger auto-re-sync.`);
+        await fs.unlink(yearFilePath).catch(() => {});
       }
     }
   }
