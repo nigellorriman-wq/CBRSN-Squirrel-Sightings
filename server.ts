@@ -6,6 +6,10 @@ import NodeCache from "node-cache";
 import fs from "fs/promises";
 import { existsSync } from "fs";
 import { SQUIRREL_GROUPS } from "./src/groups_data";
+import { fileURLToPath } from "url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 function isPointInPolygon(lat: number, lon: number, polygon: [number, number][]) {
   let inside = false;
