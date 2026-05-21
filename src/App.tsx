@@ -359,17 +359,19 @@ export default function App() {
           const redLoading = data.red?.isLoading || false;
           const greyLoading = data.grey?.isLoading || false;
           const martenLoading = data.marten?.isLoading || false;
-          const currentlyLoading = redLoading || greyLoading || martenLoading;
+          const greyTrappingLoading = data.grey_trapping?.isLoading || false;
+          const currentlyLoading = redLoading || greyLoading || martenLoading || greyTrappingLoading;
           
           let activeS = null;
           if (redLoading) activeS = data.red;
           else if (greyLoading) activeS = data.grey;
           else if (martenLoading) activeS = data.marten;
+          else if (greyTrappingLoading) activeS = data.grey_trapping;
 
           if (activeS) {
             const aggregateProgress = {
-              count: (data.red?.count || 0) + (data.grey?.count || 0) + (data.marten?.count || 0),
-              totalEstimated: (data.red?.totalEstimated || 0) + (data.grey?.totalEstimated || 0) + (data.marten?.totalEstimated || 0),
+              count: (data.red?.count || 0) + (data.grey?.count || 0) + (data.marten?.count || 0) + (data.grey_trapping?.count || 0),
+              totalEstimated: (data.red?.totalEstimated || 0) + (data.grey?.totalEstimated || 0) + (data.marten?.totalEstimated || 0) + (data.grey_trapping?.totalEstimated || 0),
               isLoading: true,
               phase: activeS.phase,
               currentYear: activeS.currentYear
@@ -583,6 +585,7 @@ export default function App() {
       await fetch(`/api/force-refresh?species=red`);
       await fetch(`/api/force-refresh?species=grey`);
       await fetch(`/api/force-refresh?species=marten`);
+      await fetch(`/api/force-refresh?species=grey_trapping`);
       
       // The polling will handle the rest
     } catch (err) {
@@ -1110,9 +1113,9 @@ export default function App() {
                     Fetching from <strong>Saving Scotland's Red Squirrels</strong> database via NBN Atlas.
                   </p>
 
-                  {syncStatusMap[species[0] === 'grey_effort' ? 'grey' : species[0]]?.lastSync && (
+                  {syncStatusMap[species[0] === 'grey_effort' ? 'grey_trapping' : species[0]]?.lastSync && (
                     <div className="pt-1 mt-1 border-t border-amber-200 text-[9px] text-amber-600 font-bold">
-                      DATABASE SNAPSHOT DATE: {new Date(syncStatusMap[species[0] === 'grey_effort' ? 'grey' : species[0]].lastSync).toLocaleString()}
+                      DATABASE SNAPSHOT DATE: {new Date(syncStatusMap[species[0] === 'grey_effort' ? 'grey_trapping' : species[0]].lastSync).toLocaleString()}
                     </div>
                   )}
 
@@ -1138,7 +1141,7 @@ export default function App() {
                     {isSyncing ? (
                       <>
                         <div className="w-3 h-3 border-2 border-amber-600 border-t-transparent rounded-full animate-spin" />
-                        FETCHING {((syncStatusMap.red?.count || 0) + (syncStatusMap.grey?.count || 0) + (syncStatusMap.marten?.count || 0)).toLocaleString()} / {((syncStatusMap.red?.totalEstimated || 0) + (syncStatusMap.grey?.totalEstimated || 0) + (syncStatusMap.marten?.totalEstimated || 0)).toLocaleString()}
+                        FETCHING {((syncStatusMap.red?.count || 0) + (syncStatusMap.grey?.count || 0) + (syncStatusMap.marten?.count || 0) + (syncStatusMap.grey_trapping?.count || 0)).toLocaleString()} / {((syncStatusMap.red?.totalEstimated || 0) + (syncStatusMap.grey?.totalEstimated || 0) + (syncStatusMap.marten?.totalEstimated || 0) + (syncStatusMap.grey_trapping?.totalEstimated || 0)).toLocaleString()}
                       </>
                     ) : (
                       'SYNC WITH NBN ATLAS'

@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
-    "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs && node -e \"const fs = require('fs'); if (fs.existsSync('data')) { fs.mkdirSync('dist/data', { recursive: true }); ['squirrel_sightings.json', 'sync_progress_v2.json'].forEach(f => { if (fs.existsSync('data/' + f)) fs.copyFileSync('data/' + f, 'dist/data/' + f); }); console.log('Database snapshot copied into build successfully.'); }\"",
+    "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs && node -e \"const fs = require('fs'); if (fs.existsSync('data')) { fs.mkdirSync('dist/data', { recursive: true }); fs.readdirSync('data').forEach(f => { if (fs.statSync('data/' + f).isFile()) fs.copyFileSync('data/' + f, 'dist/data/' + f); }); console.log('Database snapshot files copied into build successfully.'); }\"",
     "start": "node dist/server.cjs",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit"

@@ -31,11 +31,12 @@ if (existsSync(path.join(__dirname, "data"))) {
 const DATA_FILE = path.join(DATA_DIR, "squirrel_sightings.json");
 const PROGRESS_FILE = path.join(DATA_DIR, "sync_progress_v2.json");
 
-// In-memory store for bulk sightings
+// In-memory store for bulk sightings (now loaded dynamically on-demand)
 let bulkStore: Record<string, any[]> = {
   red: [],
   grey: [],
-  marten: []
+  marten: [],
+  grey_trapping: []
 };
 
 let syncStatus: Record<string, { 
@@ -48,18 +49,29 @@ let syncStatus: Record<string, {
 }> = {
   red: { isLoading: false, count: 0, totalEstimated: 0, phase: 'idle' },
   grey: { isLoading: false, count: 0, totalEstimated: 0, phase: 'idle' },
-  marten: { isLoading: false, count: 0, totalEstimated: 0, phase: 'idle' }
+  marten: { isLoading: false, count: 0, totalEstimated: 0, phase: 'idle' },
+  grey_trapping: { isLoading: false, count: 0, totalEstimated: 0, phase: 'idle' }
 };
 
 let syncProgressStore: Record<string, {
   completedYears: number[],
   isComplete: boolean,
+  count?: number,
   lastSync?: string
 }> = {
   red: { completedYears: [], isComplete: false },
   grey: { completedYears: [], isComplete: false },
-  marten: { completedYears: [], isComplete: false }
+  marten: { completedYears: [], isComplete: false },
+  grey_trapping: { completedYears: [], isComplete: false }
 };
+
+function getSpeciesFilePath(species: string) {
+  if (species === 'red') return path.join(DATA_DIR, 'red.json');
+  if (species === 'grey') return path.join(DATA_DIR, 'grey.json');
+  if (species === 'marten') return path.join(DATA_DIR, 'marten.json');
+  if (species === 'grey_trapping') return path.join(DATA_DIR, 'grey_trapping.json');
+  return path.join(DATA_DIR, `${species}.json`);
+}
 
 async function ensureDataDir() {
   if (!existsSync(DATA_DIR)) {
@@ -83,82 +95,100 @@ async function loadProgressFromFile() {
       const data = await fs.readFile(PROGRESS_FILE, 'utf-8');
       const parsed = JSON.parse(data);
       if (parsed && typeof parsed === 'object') {
-        syncProgressStore = {
-          red: { 
-            completedYears: Array.isArray(parsed.red?.completedYears) ? parsed.red.completedYears : [],
-            isComplete: !!parsed.red?.isComplete,
-            lastSync: parsed.red?.lastSync
-          },
-          grey: { 
-            completedYears: Array.isArray(parsed.grey?.completedYears) ? parsed.grey.completedYears : [],
-            isComplete: !!parsed.grey?.isComplete,
-            lastSync: parsed.grey?.lastSync
-          },
-          marten: { 
-            completedYears: Array.isArray(parsed.marten?.completedYears) ? parsed.marten.completedYears : [],
-            isComplete: !!parsed.marten?.isComplete,
-            lastSync: parsed.marten?.lastSync
+        ['red', 'grey', 'marten', 'grey_trapping'].forEach(species => {
+          const sKey = species as 'red' | 'grey' | 'marten' | 'grey_trapping';
+          if (parsed[sKey]) {
+            syncProgressStore[sKey] = {
+              completedYears: Array.isArray(parsed[sKey].completedYears) ? parsed[sKey].completedYears : [],
+              isComplete: !!parsed[sKey].isComplete,
+              count: typeof parsed[sKey].count === 'number' ? parsed[sKey].count : 0,
+              lastSync: parsed[sKey].lastSync
+            };
           }
-        };
+        });
       }
     }
-    console.log(`[Persistence] Loaded sync progress from disk. Completed years count: red=${syncProgressStore.red.completedYears.length}, grey=${syncProgressStore.grey.completedYears.length}, marten=${syncProgressStore.marten.completedYears.length}`);
+    console.log(`[Persistence] Loaded sync progress from disk. Completed years count: red=${syncProgressStore.red.completedYears.length}, grey=${syncProgressStore.grey.completedYears.length}, marten=${syncProgressStore.marten.completedYears.length}, grey_trapping=${syncProgressStore.grey_trapping.completedYears.length}`);
   } catch (err) {
     console.error("[Persistence] Error loading progress file:", err);
   }
 }
 
-async function saveDataToFile() {
+async function saveSpeciesToFile(species: 'red' | 'grey' | 'marten' | 'grey_trapping') {
   try {
     await ensureDataDir();
-    await fs.writeFile(DATA_FILE, JSON.stringify(bulkStore, null, 2));
-    console.log(`[Persistence] Data saved to ${DATA_FILE}`);
+    const filePath = getSpeciesFilePath(species);
+    const dataToSave = bulkStore[species] || [];
+    await fs.writeFile(filePath, JSON.stringify(dataToSave, null, 2));
+    console.log(`[Persistence] Saved ${dataToSave.length} records to ${filePath}`);
+    
+    // Save count to progress store to stay aligned
+    syncProgressStore[species].count = dataToSave.length;
+    await saveProgressToFile();
   } catch (error) {
-    console.error(`[Persistence] Error saving data:`, error);
+    console.error(`[Persistence] Error saving ${species} data:`, error);
+  }
+}
+
+async function saveDataToFile(species?: 'red' | 'grey' | 'marten' | 'grey_trapping') {
+  if (species) {
+    await saveSpeciesToFile(species);
+  } else {
+    await saveSpeciesToFile('red');
+    await saveSpeciesToFile('grey');
+    await saveSpeciesToFile('marten');
+    await saveSpeciesToFile('grey_trapping');
+  }
+}
+
+async function ensureSpeciesLoaded(species: 'red' | 'grey' | 'marten' | 'grey_trapping') {
+  if (bulkStore[species] && bulkStore[species].length > 0) {
+    return; // Already loaded in memory cache
+  }
+  
+  const filePath = getSpeciesFilePath(species);
+  try {
+    if (existsSync(filePath)) {
+      console.log(`[Persistence] Loading ${species} on-demand from ${filePath}...`);
+      const data = await fs.readFile(filePath, 'utf-8');
+      const parsed = JSON.parse(data);
+      if (Array.isArray(parsed)) {
+        bulkStore[species] = parsed;
+        syncStatus[species].count = parsed.length;
+        console.log(`[Persistence] Loaded ${parsed.length} records for ${species} on-demand.`);
+      }
+    }
+  } catch (error) {
+    console.error(`[Persistence] Error loading ${species} on-demand:`, error);
   }
 }
 
 async function loadDataFromFile() {
   try {
-    if (existsSync(DATA_FILE)) {
-      const data = await fs.readFile(DATA_FILE, 'utf-8');
-      const parsed = JSON.parse(data);
-      if (parsed && typeof parsed === 'object') {
-        bulkStore = parsed;
-      }
-    }
-    
-    // Ensure bulkStore is robustly initialized
-    if (!bulkStore || typeof bulkStore !== 'object') {
-      bulkStore = { red: [], grey: [], marten: [] };
-    }
-    
-    ['red', 'grey', 'marten'].forEach(species => {
-      const sKey = species as 'red' | 'grey' | 'marten';
-      if (!bulkStore[sKey] || !Array.isArray(bulkStore[sKey])) {
-        bulkStore[sKey] = [];
-      }
-      bulkStore[sKey].forEach(isSSRS);
+    // We do NOT load massive data files on startup to optimize startup speed and heap size. Load them on-demand!
+    ['red', 'grey', 'marten', 'grey_trapping'].forEach(species => {
+      const sKey = species as 'red' | 'grey' | 'marten' | 'grey_trapping';
       
-      // Keep syncStatus count and lastSync in sync with what is loaded
-      syncStatus[sKey].count = bulkStore[sKey].length;
+      // Bootstrap counts and metadata from our lightweight progress file
+      syncStatus[sKey].count = syncProgressStore[sKey]?.count || 0;
       if (syncProgressStore[sKey]?.lastSync) {
         syncStatus[sKey].lastSync = syncProgressStore[sKey].lastSync;
       }
     });
 
-    console.log(`[Persistence] Loaded ${bulkStore.red?.length || 0} red, ${bulkStore.grey?.length || 0} grey, and ${bulkStore.marten?.length || 0} marten records from file.`);
+    console.log(`[Persistence] On-demand file loader initialized. Synced counts: red=${syncStatus.red.count}, grey=${syncStatus.grey.count}, marten=${syncStatus.marten.count}, grey_trapping=${syncStatus.grey_trapping.count}`);
   } catch (error) {
-    console.error(`[Persistence] Error loading data:`, error);
-    bulkStore = { red: [], grey: [], marten: [] };
+    console.error(`[Persistence] Error initializing data counts:`, error);
   }
 }
 
-async function fetchAllSightings(species: 'red' | 'grey' | 'marten', forceReset: boolean = false) {
+async function fetchAllSightings(species: 'red' | 'grey' | 'marten' | 'grey_trapping', forceReset: boolean = false) {
   if (syncStatus[species]?.isLoading && !forceReset) {
     console.log(`[Sync] Already in progress for ${species}.`);
     return;
   }
+  
+  await ensureSpeciesLoaded(species);
   
   syncStatus[species] = { 
     ...syncStatus[species],
@@ -171,7 +201,7 @@ async function fetchAllSightings(species: 'red' | 'grey' | 'marten', forceReset:
   
   const taxonFilter = species === "red" 
     ? `taxa:"Sciurus vulgaris"`
-    : species === "grey" 
+    : (species === "grey" || species === "grey_trapping")
       ? `(taxa:"Sciurus carolinensis" OR dataResourceUid:dr637 OR dataResourceUid:dr1595 OR dataResourceUid:dr1596 OR dataResourceUid:dr1597 OR dataResourceUid:dr1598 OR dataResourceUid:dr1593 OR dataResourceName:*Squirrel*)`
       : `taxa:"Martes martes"`;
 
@@ -188,7 +218,7 @@ async function fetchAllSightings(species: 'red' | 'grey' | 'marten', forceReset:
     // Large geographic box covering Scotland
     const geoFq = `decimalLatitude:[54.0 TO 62.0] AND decimalLongitude:[-11.0 TO 2.0]`;
     // Include both present and absent records for trapping effort
-    const statusFq = species === "grey" ? `(occurrenceStatus:present OR occurrenceStatus:absent)` : `occurrenceStatus:present`;
+    const statusFq = (species === "grey" || species === "grey_trapping") ? `(occurrenceStatus:present OR occurrenceStatus:absent)` : `occurrenceStatus:present`;
 
     const globalCheck = await axios.get(url, {
       params: {
@@ -298,8 +328,8 @@ async function fetchAllSightings(species: 'red' | 'grey' | 'marten', forceReset:
               const totalInRequest = responseData.totalRecords || 0;
               
               if (records.length === 0) {
-                hasMoreInPeriod = false;
-                continue;
+                 hasMoreInPeriod = false;
+                 continue;
               }
 
               const rawFetchedCount = records.length;
@@ -307,6 +337,11 @@ async function fetchAllSightings(species: 'red' | 'grey' | 'marten', forceReset:
                 const recordId = r.uuid || r.id;
                 if (recordId) {
                   isSSRS(r); // Tag it
+                  
+                  // Filter based on species requested and trapping status
+                  if (species === 'grey' && r.isTrapping) return;
+                  if (species === 'grey_trapping' && !r.isTrapping) return;
+
                   recordMap.set(recordId, r);
                   r.id = recordId;
                 }
@@ -341,7 +376,7 @@ async function fetchAllSightings(species: 'red' | 'grey' | 'marten', forceReset:
         await saveProgressToFile();
         
         // Save progress to disk for every year to ensure no data loss even if sync is interrupted or stalls
-        await saveDataToFile();
+        await saveDataToFile(species);
       } else {
         console.warn(`[Sync] ${species} ${year} had fetch errors, not marking as complete.`);
       }
@@ -357,7 +392,7 @@ async function fetchAllSightings(species: 'red' | 'grey' | 'marten', forceReset:
     syncProgressStore[species].lastSync = syncStatus[species].lastSync;
     await saveProgressToFile();
 
-    await saveDataToFile();
+    await saveDataToFile(species);
     syncStatus[species].phase = 'Complete';
   } catch (error) {
     console.error(`[Bulk Load] Fatal error syncing ${species}:`, error);
@@ -492,7 +527,7 @@ const isSSRS = (s: any) => {
 };
 
 // Sequential Serialization Queue to prevent race conditions & write corruption
-let syncQueue: { species: 'red' | 'grey' | 'marten'; forceReset: boolean }[] = [];
+let syncQueue: { species: 'red' | 'grey' | 'marten' | 'grey_trapping'; forceReset: boolean }[] = [];
 let isProcessingQueue = false;
 
 async function processSyncQueue() {
@@ -513,7 +548,7 @@ async function processSyncQueue() {
   isProcessingQueue = false;
 }
 
-function enqueueSync(species: 'red' | 'grey' | 'marten', forceReset: boolean = false) {
+function enqueueSync(species: 'red' | 'grey' | 'marten' | 'grey_trapping', forceReset: boolean = false) {
   const alreadyInQueue = syncQueue.some(t => t.species === species);
   const isCurrentlySyncing = syncStatus[species]?.isLoading;
   
@@ -550,16 +585,22 @@ async function startServer() {
       status: "ok", 
       time: new Date().toISOString(),
       counts: {
-        red: bulkStore.red.length,
-        grey: bulkStore.grey.length,
-        marten: bulkStore.marten.length
+        red: syncStatus.red.count || bulkStore.red.length,
+        grey: syncStatus.grey.count || bulkStore.grey.length,
+        marten: syncStatus.marten.count || bulkStore.marten.length,
+        grey_trapping: syncStatus.grey_trapping.count || bulkStore.grey_trapping.length
       },
       syncStatus
     });
   });
 
   // Database analysis report of datasets and references
-  app.get("/api/db-report", (req, res) => {
+  app.get("/api/db-report", async (req, res) => {
+    await ensureSpeciesLoaded('red');
+    await ensureSpeciesLoaded('grey');
+    await ensureSpeciesLoaded('marten');
+    await ensureSpeciesLoaded('grey_trapping');
+
     const report: Record<string, {
       species: string;
       resourceUid: string;
@@ -568,7 +609,7 @@ async function startServer() {
       trappingCount: number;
     }> = {};
 
-    ['red', 'grey', 'marten'].forEach(species => {
+    ['red', 'grey', 'marten', 'grey_trapping'].forEach(species => {
       const records = bulkStore[species] || [];
       records.forEach(r => {
         const uid = r.dataResourceUid || r.data_resource_uid || 'unknown_uid';
@@ -603,10 +644,13 @@ async function startServer() {
       // Start background sync for species immediately if needed
       responseSpecies.forEach((s) => {
         const sQuery = s as string;
-        const sKey = (['red', 'grey', 'marten'].includes(sQuery) ? sQuery : (sQuery === 'grey_effort' ? 'grey' : null)) as 'red' | 'grey' | 'marten' | null;
+        const sKey = (sQuery === 'grey_effort' ? 'grey_trapping' : sQuery) as 'red' | 'grey' | 'marten' | 'grey_trapping';
         
-        if (sKey && (bulkStore[sKey].length < 10 || forceRefresh === 'true')) {
-          enqueueSync(sKey, forceRefresh === 'true'); 
+        if (['red', 'grey', 'marten', 'grey_trapping'].includes(sKey)) {
+          const count = syncStatus[sKey]?.count || 0;
+          if (count < 10 || forceRefresh === 'true') {
+            enqueueSync(sKey, forceRefresh === 'true'); 
+          }
         }
       });
 
@@ -615,20 +659,14 @@ async function startServer() {
       // Proceed with filtering current data
       const resultsBySpecies = await Promise.all(responseSpecies.map(async (s) => {
         const sQuery = s as string;
-        const sKey = (['red', 'grey', 'marten'].includes(sQuery) ? sQuery : (sQuery === 'grey_effort' ? 'grey' : 'red')) as 'red' | 'grey' | 'marten';
-        let results = (bulkStore[sKey] || []).filter((r) => {
-          isSSRS(r);
-          const actualSp = getActualSpecies(r);
-          if (sQuery === 'red') return actualSp === 'red';
-          if (sQuery === 'grey' || sQuery === 'grey_effort') return actualSp === 'grey';
-          if (sQuery === 'marten') return actualSp === 'marten';
-          return false;
-        });
+        const sKey = (sQuery === 'grey_effort' ? 'grey_trapping' : sQuery) as 'red' | 'grey' | 'marten' | 'grey_trapping';
+        
+        await ensureSpeciesLoaded(sKey);
+        let results = bulkStore[sKey] || [];
 
         if (sQuery === 'grey_effort') {
-          const trappingResults = results.filter(r => r.isTrapping === true);
           const grouped: Record<string, any> = {};
-          trappingResults.forEach(r => {
+          results.forEach(r => {
             const key = `${r.decimalLatitude},${r.decimalLongitude}`;
             const count = parseInt(r.individualCount) || 1;
             if (!grouped[key]) {
@@ -730,7 +768,7 @@ async function startServer() {
 
       const anySyncing = responseSpecies.some(s => {
         const sQuery = s as string;
-        const sKey = (['red', 'grey', 'marten'].includes(sQuery) ? sQuery : (sQuery === 'grey_effort' ? 'grey' : null)) as 'red' | 'grey' | 'marten' | null;
+        const sKey = (sQuery === 'grey_effort' ? 'grey_trapping' : sQuery) as 'red' | 'grey' | 'marten' | 'grey_trapping';
         return sKey && syncStatus[sKey]?.isLoading;
       });
 
@@ -818,8 +856,18 @@ async function startServer() {
   // API Route to export data source statistics as CSV
   app.get("/api/stats-csv", async (req, res) => {
     try {
+      await ensureSpeciesLoaded('red');
+      await ensureSpeciesLoaded('grey');
+      await ensureSpeciesLoaded('marten');
+      await ensureSpeciesLoaded('grey_trapping');
+
       const sourceCounts: Record<string, number> = {};
-      const allSightings = [...bulkStore.red, ...bulkStore.grey, ...bulkStore.marten];
+      const allSightings = [
+        ...(bulkStore.red || []),
+        ...(bulkStore.grey || []),
+        ...(bulkStore.marten || []),
+        ...(bulkStore.grey_trapping || [])
+      ];
       
       allSightings.forEach(s => {
         const source = s.dataResourceName || "Unknown Source";
@@ -882,11 +930,16 @@ async function startServer() {
 
   app.get("/api/force-refresh", async (req, res) => {
     const { species } = req.query;
-    if (species === "red" || species === "grey" || species === "marten") {
-      enqueueSync(species as 'red' | 'grey' | 'marten', true);
+    if (species === "red" || species === "grey" || species === "marten" || species === "grey_trapping") {
+      enqueueSync(species as 'red' | 'grey' | 'marten' | 'grey_trapping', true);
       res.json({ message: `Sync started for ${species}` });
     } else {
-      res.status(400).json({ error: "Invalid species" });
+      // Enqueue all in sequence!
+      enqueueSync('red', true);
+      enqueueSync('grey', true);
+      enqueueSync('marten', true);
+      enqueueSync('grey_trapping', true);
+      res.json({ message: `Sequential sync started for all four categories (red, grey, marten, grey_trapping)` });
     }
   });
 
@@ -897,10 +950,24 @@ async function startServer() {
 
   // End point to export full database as JSON
   app.get("/api/export", async (req, res) => {
-    if (existsSync(DATA_FILE)) {
-      res.download(DATA_FILE, "scottish_squirrel_sightings.json");
-    } else {
-      res.status(404).json({ error: "Data file not found. Try syncing first." });
+    try {
+      await ensureSpeciesLoaded('red');
+      await ensureSpeciesLoaded('grey');
+      await ensureSpeciesLoaded('marten');
+      await ensureSpeciesLoaded('grey_trapping');
+      
+      const combined = {
+        red: bulkStore.red || [],
+        grey: bulkStore.grey || [],
+        marten: bulkStore.marten || [],
+        grey_trapping: bulkStore.grey_trapping || []
+      };
+      
+      res.setHeader('Content-Type', 'application/json');
+      res.setHeader('Content-Disposition', 'attachment; filename=scottish_squirrel_sightings.json');
+      res.send(JSON.stringify(combined, null, 2));
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
     }
   });
 
@@ -915,8 +982,9 @@ async function startServer() {
       const red = Array.isArray(data.red) ? data.red : [];
       const grey = Array.isArray(data.grey) ? data.grey : [];
       const marten = Array.isArray(data.marten) ? data.marten : [];
+      const grey_trapping = Array.isArray(data.grey_trapping) ? data.grey_trapping : [];
 
-      if (red.length === 0 && grey.length === 0 && marten.length === 0) {
+      if (red.length === 0 && grey.length === 0 && marten.length === 0 && grey_trapping.length === 0) {
         return res.status(400).json({ error: "No records found in the uploaded file, or invalid JSON structure." });
       }
 
@@ -924,9 +992,10 @@ async function startServer() {
       bulkStore.red = red;
       bulkStore.grey = grey;
       bulkStore.marten = marten;
+      bulkStore.grey_trapping = grey_trapping;
 
       // Re-apply SSRS tagging logic to all imported records
-      ['red', 'grey', 'marten'].forEach(species => {
+      ['red', 'grey', 'marten', 'grey_trapping'].forEach(species => {
         bulkStore[species].forEach(isSSRS);
       });
 
@@ -938,9 +1007,10 @@ async function startServer() {
       }
       
       const tsNow = new Date().toISOString();
-      syncProgressStore.red = { completedYears: [...allYears], isComplete: true, lastSync: tsNow };
-      syncProgressStore.grey = { completedYears: [...allYears], isComplete: true, lastSync: tsNow };
-      syncProgressStore.marten = { completedYears: [...allYears], isComplete: true, lastSync: tsNow };
+      syncProgressStore.red = { completedYears: [...allYears], isComplete: true, count: red.length, lastSync: tsNow };
+      syncProgressStore.grey = { completedYears: [...allYears], isComplete: true, count: grey.length, lastSync: tsNow };
+      syncProgressStore.marten = { completedYears: [...allYears], isComplete: true, count: marten.length, lastSync: tsNow };
+      syncProgressStore.grey_trapping = { completedYears: [...allYears], isComplete: true, count: grey_trapping.length, lastSync: tsNow };
       await saveProgressToFile();
 
       // Save to server local disk/file
@@ -950,8 +1020,14 @@ async function startServer() {
       syncStatus.red.count = bulkStore.red.length;
       syncStatus.grey.count = bulkStore.grey.length;
       syncStatus.marten.count = bulkStore.marten.length;
+      syncStatus.grey_trapping.count = bulkStore.grey_trapping.length;
 
-      console.log(`[Import] Local copy successfully uploaded. New counts: red=${bulkStore.red.length}, grey=${bulkStore.grey.length}, marten=${bulkStore.marten.length}`);
+      syncStatus.red.lastSync = tsNow;
+      syncStatus.grey.lastSync = tsNow;
+      syncStatus.marten.lastSync = tsNow;
+      syncStatus.grey_trapping.lastSync = tsNow;
+
+      console.log(`[Import] Local copy successfully uploaded. New counts: red=${bulkStore.red.length}, grey=${bulkStore.grey.length}, marten=${bulkStore.marten.length}, grey_trapping=${bulkStore.grey_trapping.length}`);
 
       res.json({
         success: true,
@@ -959,7 +1035,8 @@ async function startServer() {
         counts: {
           red: bulkStore.red.length,
           grey: bulkStore.grey.length,
-          marten: bulkStore.marten.length
+          marten: bulkStore.marten.length,
+          grey_trapping: bulkStore.grey_trapping.length
         }
       });
     } catch (err: any) {
@@ -1002,10 +1079,10 @@ async function startServer() {
     if (process.env.NODE_ENV !== "production") {
       setTimeout(() => {
         try {
-          ['red', 'grey', 'marten'].forEach(species => {
-            const sKey = species as 'red' | 'grey' | 'marten';
+          ['red', 'grey', 'marten', 'grey_trapping'].forEach(species => {
+            const sKey = species as 'red' | 'grey' | 'marten' | 'grey_trapping';
             if (!bulkStore || typeof bulkStore !== 'object') {
-              bulkStore = { red: [], grey: [], marten: [] };
+              bulkStore = { red: [], grey: [], marten: [], grey_trapping: [] };
             }
             if (!bulkStore[sKey] || !Array.isArray(bulkStore[sKey])) {
               bulkStore[sKey] = [];
