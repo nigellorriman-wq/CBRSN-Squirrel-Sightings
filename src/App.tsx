@@ -181,6 +181,7 @@ export default function App() {
   const [distance, setDistance] = useState(0);
   const [isSyncing, setIsSyncing] = useState(false);
   const [syncProgress, setSyncProgress] = useState<any>(null);
+  const [stopDisplayingDuringFetch, setStopDisplayingDuringFetch] = useState(true);
   const [syncStatusMap, setSyncStatusMap] = useState<Record<string, any>>({});
   
   const lastSyncDate = useMemo(() => {
@@ -424,6 +425,9 @@ export default function App() {
 
   // Memoized Map Markers to prevent re-renders during map move/sidebar toggle
   const filteredSightings = useMemo(() => {
+    if (isSyncing && stopDisplayingDuringFetch) {
+      return [];
+    }
     if (!selectedGroup) return sightings;
     const group = SQUIRREL_GROUPS.find(g => g.name === selectedGroup);
     if (!group) return sightings;
@@ -433,7 +437,7 @@ export default function App() {
       const lon = parseFloat(s.decimalLongitude);
       return isPointInPolygon(lat, lon, group.polygon as [number, number][]);
     });
-  }, [sightings, selectedGroup]);
+  }, [sightings, selectedGroup, isSyncing, stopDisplayingDuringFetch]);
 
   const { aggregatedSquares, maxCount } = useMemo(() => {
     const squares: Record<string, {
@@ -1158,6 +1162,20 @@ export default function App() {
                           </button>
                         ))}
                       </div>
+                    </div>
+
+                    <div className="flex items-center justify-between pt-2 border-t border-stone-100 mt-2">
+                      <span className="text-[10px] font-bold text-stone-500 uppercase tracking-wider">Hide Data During Sync</span>
+                      <button
+                        onClick={() => setStopDisplayingDuringFetch(!stopDisplayingDuringFetch)}
+                        className={`px-3 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-tight border transition-all ${
+                          stopDisplayingDuringFetch 
+                          ? 'bg-amber-600 text-white border-amber-600 shadow-sm' 
+                          : 'bg-white text-stone-600 border-stone-200 hover:border-stone-400'
+                        }`}
+                      >
+                        {stopDisplayingDuringFetch ? 'ON' : 'OFF'}
+                      </button>
                     </div>
                   </div>
                 </div>
