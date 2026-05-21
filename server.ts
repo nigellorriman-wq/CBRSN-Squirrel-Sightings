@@ -5,12 +5,31 @@ import axios from "axios";
 import NodeCache from "node-cache";
 import fs from "fs/promises";
 import { existsSync } from "fs";
+import { SQUIRREL_GROUPS } from "./src/groups_data";
+
+function isPointInPolygon(lat: number, lon: number, polygon: [number, number][]) {
+  let inside = false;
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    const xi = polygon[i][0], yi = polygon[i][1];
+    const xj = polygon[j][0], yj = polygon[j][1];
+    const intersect = ((yi > lon) !== (yj > lon)) && (lat < (xj - xi) * (lon - yi) / (yj - yi) + xi);
+    if (intersect) inside = !inside;
+  }
+  return inside;
+}
 
 // Initialize cache with 24 hour TTL
 const sightingsCache = new NodeCache({ stdTTL: 86400, checkperiod: 3600 });
 
-const DATA_DIR = path.join(process.cwd(), "data");
+let DATA_DIR = path.join(process.cwd(), "data");
+if (existsSync(path.join(__dirname, "data"))) {
+  DATA_DIR = path.join(__dirname, "data");
+} else if (existsSync(path.join(__dirname, "../data"))) {
+  DATA_DIR = path.join(__dirname, "../data");
+}
+
 const DATA_FILE = path.join(DATA_DIR, "squirrel_sightings.json");
+const PROGRESS_FILE = path.join(DATA_DIR, "sync_progress_v2.json");
 
 // In-memory store for bulk sightings
 let bulkStore: Record<string, any[]> = {
@@ -32,9 +51,60 @@ let syncStatus: Record<string, {
   marten: { isLoading: false, count: 0, totalEstimated: 0, phase: 'idle' }
 };
 
+let syncProgressStore: Record<string, {
+  completedYears: number[],
+  isComplete: boolean,
+  lastSync?: string
+}> = {
+  red: { completedYears: [], isComplete: false },
+  grey: { completedYears: [], isComplete: false },
+  marten: { completedYears: [], isComplete: false }
+};
+
 async function ensureDataDir() {
   if (!existsSync(DATA_DIR)) {
     await fs.mkdir(DATA_DIR, { recursive: true });
+  }
+}
+
+async function saveProgressToFile() {
+  try {
+    await ensureDataDir();
+    await fs.writeFile(PROGRESS_FILE, JSON.stringify(syncProgressStore, null, 2));
+    console.log(`[Persistence] Sync progress saved to ${PROGRESS_FILE}`);
+  } catch (error) {
+    console.error(`[Persistence] Error saving progress:`, error);
+  }
+}
+
+async function loadProgressFromFile() {
+  try {
+    if (existsSync(PROGRESS_FILE)) {
+      const data = await fs.readFile(PROGRESS_FILE, 'utf-8');
+      const parsed = JSON.parse(data);
+      if (parsed && typeof parsed === 'object') {
+        syncProgressStore = {
+          red: { 
+            completedYears: Array.isArray(parsed.red?.completedYears) ? parsed.red.completedYears : [],
+            isComplete: !!parsed.red?.isComplete,
+            lastSync: parsed.red?.lastSync
+          },
+          grey: { 
+            completedYears: Array.isArray(parsed.grey?.completedYears) ? parsed.grey.completedYears : [],
+            isComplete: !!parsed.grey?.isComplete,
+            lastSync: parsed.grey?.lastSync
+          },
+          marten: { 
+            completedYears: Array.isArray(parsed.marten?.completedYears) ? parsed.marten.completedYears : [],
+            isComplete: !!parsed.marten?.isComplete,
+            lastSync: parsed.marten?.lastSync
+          }
+        };
+      }
+    }
+    console.log(`[Persistence] Loaded sync progress from disk. Completed years count: red=${syncProgressStore.red.completedYears.length}, grey=${syncProgressStore.grey.completedYears.length}, marten=${syncProgressStore.marten.completedYears.length}`);
+  } catch (err) {
+    console.error("[Persistence] Error loading progress file:", err);
   }
 }
 
@@ -52,16 +122,35 @@ async function loadDataFromFile() {
   try {
     if (existsSync(DATA_FILE)) {
       const data = await fs.readFile(DATA_FILE, 'utf-8');
-      bulkStore = JSON.parse(data);
-      console.log(`[Persistence] Loaded ${bulkStore.red?.length || 0} red, ${bulkStore.grey?.length || 0} grey, and ${bulkStore.marten?.length || 0} marten records from file.`);
-      
-      // Ensure keys exist if it's an old file
-      if (!bulkStore.red) bulkStore.red = [];
-      if (!bulkStore.grey) bulkStore.grey = [];
-      if (!bulkStore.marten) bulkStore.marten = [];
+      const parsed = JSON.parse(data);
+      if (parsed && typeof parsed === 'object') {
+        bulkStore = parsed;
+      }
     }
+    
+    // Ensure bulkStore is robustly initialized
+    if (!bulkStore || typeof bulkStore !== 'object') {
+      bulkStore = { red: [], grey: [], marten: [] };
+    }
+    
+    ['red', 'grey', 'marten'].forEach(species => {
+      const sKey = species as 'red' | 'grey' | 'marten';
+      if (!bulkStore[sKey] || !Array.isArray(bulkStore[sKey])) {
+        bulkStore[sKey] = [];
+      }
+      bulkStore[sKey].forEach(isSSRS);
+      
+      // Keep syncStatus count and lastSync in sync with what is loaded
+      syncStatus[sKey].count = bulkStore[sKey].length;
+      if (syncProgressStore[sKey]?.lastSync) {
+        syncStatus[sKey].lastSync = syncProgressStore[sKey].lastSync;
+      }
+    });
+
+    console.log(`[Persistence] Loaded ${bulkStore.red?.length || 0} red, ${bulkStore.grey?.length || 0} grey, and ${bulkStore.marten?.length || 0} marten records from file.`);
   } catch (error) {
     console.error(`[Persistence] Error loading data:`, error);
+    bulkStore = { red: [], grey: [], marten: [] };
   }
 }
 
@@ -81,30 +170,33 @@ async function fetchAllSightings(species: 'red' | 'grey' | 'marten', forceReset:
   console.log(`[Bulk Load] Starting sync for ${species} in Scotland (Year by Year)...`);
   
   const taxonFilter = species === "red" 
-    ? `scientificName:"Sciurus vulgaris"`
+    ? `taxa:"Sciurus vulgaris"`
     : species === "grey" 
-      ? `scientificName:"Sciurus carolinensis"`
-      : `scientificName:"Martes martes"`;
-  
+      ? `(taxa:"Sciurus carolinensis" OR dataResourceUid:dr637 OR dataResourceUid:dr1595 OR dataResourceUid:dr1596 OR dataResourceUid:dr1597 OR dataResourceUid:dr1598 OR dataResourceUid:dr1593 OR dataResourceName:*Squirrel*)`
+      : `taxa:"Martes martes"`;
+
   const query = taxonFilter;
-  
+
   const url = `https://records-ws.nbnatlas.org/occurrences/search`;
   const currentYear = new Date().getFullYear();
-  
+
   // Use existing records as base for incremental update
   const existingRecords = bulkStore[species] || [];
   const recordMap = new Map(existingRecords.filter(r => r && (r.id || r.uuid)).map(r => [r.id || r.uuid, r]));
-  
+
   try {
-    // Get accurate global total first
+    // Large geographic box covering Scotland
     const geoFq = `decimalLatitude:[54.0 TO 62.0] AND decimalLongitude:[-11.0 TO 2.0]`;
+    // Include both present and absent records for trapping effort
+    const statusFq = species === "grey" ? `(occurrenceStatus:present OR occurrenceStatus:absent)` : `occurrenceStatus:present`;
 
     const globalCheck = await axios.get(url, {
       params: {
         q: query,
-        fq: `${geoFq} AND year:[2008 TO ${currentYear}]`,
+        fq: `${geoFq} AND ${statusFq} AND year:[2000 TO ${currentYear}]`,
         pageSize: 0
-      }
+      },
+      timeout: 30000
     });
 
     console.log(`[Sync] ${species}: Global check URL: ${url}?q=${encodeURIComponent(query)}&fq=${encodeURIComponent(geoFq)}`);
@@ -112,89 +204,146 @@ async function fetchAllSightings(species: 'red' | 'grey' | 'marten', forceReset:
     syncStatus[species].totalEstimated = totalExpected;
     syncStatus[species].count = recordMap.size;
 
-    console.log(`[Sync] ${species}: Starting fetch for ${totalExpected} records.`);
+    console.log(`[Sync] ${species}: Found ${totalExpected} records in total search.`);
 
     if (forceReset) {
-      recordMap.clear();
-      bulkStore[species] = [];
-      syncStatus[species].count = 0;
+      if (syncProgressStore[species]?.isComplete) {
+        // It was fully complete previously. This is a brand new request to fully refresh.
+        console.log(`[Sync] ${species} was fully complete previously. Wiping and starting fresh.`);
+        syncProgressStore[species].completedYears = [];
+        syncProgressStore[species].isComplete = false;
+        await saveProgressToFile();
+        
+        recordMap.clear();
+        bulkStore[species] = [];
+        syncStatus[species].count = 0;
+      } else {
+        // Resume incomplete/stalled download! Keep years already marked as completed.
+        const completedYears = syncProgressStore[species]?.completedYears || [];
+        if (completedYears.length === 0) {
+          recordMap.clear();
+          bulkStore[species] = [];
+          syncStatus[species].count = 0;
+        } else {
+          const completedYearsSet = new Set(completedYears.map(Number));
+          const filteredRecords = existingRecords.filter(r => r && completedYearsSet.has(Number(r.year)));
+          recordMap.clear();
+          filteredRecords.forEach((r: any) => {
+            const recordId = r.uuid || r.id;
+            if (recordId) recordMap.set(recordId, r);
+          });
+          bulkStore[species] = filteredRecords;
+          syncStatus[species].count = recordMap.size;
+          console.log(`[Sync] Resuming incomplete ${species} sync with ${completedYears.length} completed years. Retained ${recordMap.size} records.`);
+        }
+      }
     }
 
-    // Sync most recent years first
-    for (let year = currentYear; year >= 2008; year--) {
+    // Sync from year 2000 to current
+    for (let year = currentYear; year >= 2000; year--) {
+      if (syncProgressStore[species]?.completedYears?.includes(year)) {
+        console.log(`[Sync] ${species} ${year} already completed in previous attempt. Skipping.`);
+        continue;
+      }
+      
       syncStatus[species].currentYear = year;
+      let yearHasError = false;
+      let yearTotal = 0;
       
-      const yearCheck = await axios.get(url, {
-        params: {
-          q: query,
-          fq: `${geoFq} AND year:${year}`,
-          pageSize: 0
-        }
-      });
-      const yearTotal = yearCheck.data.totalRecords || 0;
-      console.log(`[Sync] ${species} ${year}: Found ${yearTotal} records`);
+      try {
+        const yearCheck = await axios.get(url, {
+          params: {
+            q: query,
+            fq: `${geoFq} AND ${statusFq} AND year:${year}`,
+            pageSize: 0
+          },
+          timeout: 20000
+        });
+        yearTotal = yearCheck.data.totalRecords || 0;
+        console.log(`[Sync] ${species} ${year}: ${yearTotal} records`);
+      } catch (err: any) {
+        console.error(`[Sync] Error during year check for ${species} ${year}:`, err.message);
+        yearHasError = true;
+      }
       
-      if (yearTotal === 0) continue;
+      if (yearTotal > 0 && !yearHasError) {
+        // If more than 4000 records in a year, fetch month by month to stay under NBN's 10k limit per export
+        const months = yearTotal > 4000 ? [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] : [null];
 
-      const months = yearTotal > 4500 ? [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] : [null];
+        for (const month of months) {
+          if (yearHasError) break;
+          syncStatus[species].phase = `Fetching ${year}${month ? '-' + month : ''}`;
+          
+          let startOffset = 0;
+          const pageSize = 1000;
+          let hasMoreInPeriod = true;
 
-      for (const month of months) {
-        syncStatus[species].phase = `Fetching ${species} records for ${year}${month ? '-' + month : ''}`;
-        
-        let startOffset = 0;
-        const pageSize = 1000;
-        let hasMoreInPeriod = true;
+          const periodFq = `${geoFq} AND ${statusFq} AND year:${year}${month ? ' AND month:' + month : ''}`;
 
-        const periodFq = `${geoFq} AND year:${year}${month ? ' AND month:' + month : ''}`;
+          while (hasMoreInPeriod) {
+            try {
+              const response = await axios.get(url, {
+                params: {
+                  q: query,
+                  fq: periodFq,
+                  pageSize: pageSize,
+                  start: startOffset,
+                  fl: "id,uuid,decimalLatitude,decimalLongitude,year,scientificName,raw_commonName,vernacularName,occurrenceDate,eventDate,dataResourceName,dataResourceUid,collectionCode,raw_collectionCode,coordinateUncertaintyInMeters,gridReference,institutionCode,raw_institutionCode,individualCount,occurrenceRemarks,raw_occurrenceRemarks,occurrenceStatus,raw_occurrenceStatus,occurrenceID",
+                },
+                timeout: 30000
+              });
 
-        while (hasMoreInPeriod) {
-          try {
-            const response = await axios.get(url, {
-              params: {
-                q: query,
-                fq: periodFq,
-                pageSize: pageSize,
-                start: startOffset,
-                fl: "id,uuid,decimalLatitude,decimalLongitude,year,scientificName,raw_commonName,occurrenceDate,dataResourceName,dataResourceUid",
-              },
-              timeout: 60000
-            });
-
-            const responseData = response.data;
-            let records = responseData.occurrences || [];
-            const totalInRequest = responseData.totalRecords || 0;
-            
-            if (records.length === 0) {
-              hasMoreInPeriod = false;
-              continue;
-            }
-
-            const rawFetchedCount = records.length;
-            let matchedInBatch = 0;
-            records.forEach((r: any) => {
-              const recordId = r.uuid || r.id;
-              if (recordId && isSSRS(r)) {
-                recordMap.set(recordId, r);
-                r.id = recordId; // Ensure id field exists for frontend
-                matchedInBatch++;
+              const responseData = response.data;
+              let records = responseData.occurrences || [];
+              const totalInRequest = responseData.totalRecords || 0;
+              
+              if (records.length === 0) {
+                hasMoreInPeriod = false;
+                continue;
               }
-            });
 
-            syncStatus[species].count = recordMap.size;
-            // Update store once per batch but avoid massive overhead
-            bulkStore[species] = Array.from(recordMap.values());
-            
-            if (rawFetchedCount < pageSize || startOffset + rawFetchedCount >= totalInRequest || startOffset + rawFetchedCount >= 10000) {
-              hasMoreInPeriod = false;
-            } else {
-              startOffset += rawFetchedCount;
+              const rawFetchedCount = records.length;
+              records.forEach((r: any) => {
+                const recordId = r.uuid || r.id;
+                if (recordId) {
+                  isSSRS(r); // Tag it
+                  recordMap.set(recordId, r);
+                  r.id = recordId;
+                }
+              });
+
+              syncStatus[species].count = recordMap.size;
+              // Immediate update to store for visibility
+              bulkStore[species] = Array.from(recordMap.values());
+              
+              if (rawFetchedCount < pageSize || startOffset + rawFetchedCount >= totalInRequest || startOffset + rawFetchedCount >= 10000) {
+                hasMoreInPeriod = false;
+              } else {
+                startOffset += rawFetchedCount;
+              }
+            } catch (err: any) {
+              console.error(`[Sync] Error at ${year}${month ? '-' + month : ''}, offset ${startOffset}:`, err.message);
+              yearHasError = true;
+              hasMoreInPeriod = false; 
+              await new Promise(r => setTimeout(r, 1000));
             }
-          } catch (err: any) {
-            console.error(`[Bulk Load] Error at ${year}${month ? '-' + month : ''}, offset ${startOffset}:`, err.message);
-            hasMoreInPeriod = false; 
-            await new Promise(r => setTimeout(r, 2000));
           }
         }
+      }
+
+      if (!yearHasError) {
+        if (!syncProgressStore[species].completedYears) {
+          syncProgressStore[species].completedYears = [];
+        }
+        if (!syncProgressStore[species].completedYears.includes(year)) {
+          syncProgressStore[species].completedYears.push(year);
+        }
+        await saveProgressToFile();
+        
+        // Save progress to disk for every year to ensure no data loss even if sync is interrupted or stalls
+        await saveDataToFile();
+      } else {
+        console.warn(`[Sync] ${species} ${year} had fetch errors, not marking as complete.`);
       }
     }
 
@@ -202,6 +351,12 @@ async function fetchAllSightings(species: 'red' | 'grey' | 'marten', forceReset:
     bulkStore[species] = Array.from(recordMap.values());
     syncStatus[species].phase = 'Saving to disk';
     syncStatus[species].lastSync = new Date().toISOString();
+    
+    // Set isComplete to true and save progress!
+    syncProgressStore[species].isComplete = true;
+    syncProgressStore[species].lastSync = syncStatus[species].lastSync;
+    await saveProgressToFile();
+
     await saveDataToFile();
     syncStatus[species].phase = 'Complete';
   } catch (error) {
@@ -215,11 +370,159 @@ async function fetchAllSightings(species: 'red' | 'grey' | 'marten', forceReset:
 // Start initial background sync and load from file - moved inside startServer
 // (async () => { ... })();
 
+const getActualSpecies = (s: any): "red" | "grey" | "marten" | "other" => {
+  if (!s) return "other";
+  const sciName = String(s.scientificName || s.species || "").toLowerCase();
+  const commonName = String(s.raw_commonName || s.vernacularName || "").toLowerCase();
+  
+  if (sciName.includes("vulgaris") || commonName.includes("red squirrel")) {
+    return "red";
+  }
+  if (
+    sciName.includes("carolinensis") || 
+    commonName.includes("grey squirrel") || 
+    commonName.includes("gray squirrel")
+  ) {
+    return "grey";
+  }
+  if (sciName.includes("martes") || commonName.includes("marten")) {
+    return "marten";
+  }
+  return "other";
+};
+
 const isSSRS = (s: any) => {
-  if (!s) return false;
-  // Permissive to include all records as requested by user
+  try {
+    if (!s) return false;
+    
+    // Standardize property names in-place to handle Solr raw/prefixed/timestamp names
+    s.id = s.uuid || s.id;
+    s.occurrenceID = s.occurrenceID || s.raw_occurrenceId || '';
+    s.collectionCode = s.collectionCode || s.raw_collectionCode || '';
+    s.institutionCode = s.institutionCode || s.raw_institutionCode || '';
+    s.raw_commonName = s.raw_commonName || s.vernacularName || '';
+    s.occurrenceRemarks = s.occurrenceRemarks || s.raw_occurrenceRemarks || '';
+    s.occurrenceStatus = s.occurrenceStatus || s.raw_occurrenceStatus || 'present';
+
+    if (s.eventDate && !s.occurrenceDate) {
+      try {
+        s.occurrenceDate = new Date(s.eventDate).toISOString();
+      } catch (e) {
+        // ignore parsing errors for malformed timestamps
+      }
+    }
+    
+    const rawName = String(s.raw_commonName || s.vernacularName || s.scientificName || s.species || '').toLowerCase();
+    const resourceName = String(s.dataResourceName || '').toLowerCase();
+    const remarks = String(s.occurrenceRemarks || s.raw_occurrenceRemarks || '').toLowerCase();
+    const institution = String(s.institutionCode || s.raw_institutionCode || '').toLowerCase();
+    const resUid = String(s.dataResourceUid || '');
+    const collectionCodeVal = String(s.collectionCode || s.raw_collectionCode || '').toUpperCase();
+    
+    // Official Trapping/Control Datasets (including dr949 - The Scottish Squirrel Database)
+    const isTrappingDataset = 
+      resUid === "dr949" ||   // The Scottish Squirrel Database (actual NBN ID containing SWT records)
+      resUid === "dr637" ||   // SSRS Standardised Survey
+      resUid === "dr1595" ||  // SSRS GSSRS Private
+      resUid === "dr1596" ||  // SSRS GSSRS Staff/Vol
+      resUid === "dr1597" ||  // SSRS Effort Vol
+      resUid === "dr1598" ||  // SSRS Effort Staff
+      resUid === "dr1593" ||  // SSRS Generalised
+      resUid === "dr171" ||   // SSRS Sightings (sometimes includes GSSRS)
+      resUid === "dr1089" ||  // Older/Alternative list ID
+      resUid === "dr1738" ||  // FLS Red and Grey records
+      resUid === "dr649" ||   // Borders
+      resUid === "dr723" ||   // Angus
+      resUid === "dr703" ||   // Grampian
+      resUid === "dr361";     // Tayside
+      
+    // Tag records as trapping if they match SSRS criteria or explicitly mention control/trapping
+    const isSSRSProject = 
+      collectionCodeVal.includes("SSRS") || 
+      collectionCodeVal.includes("GSSRS") || 
+      resourceName.includes("gssrs") ||
+      resourceName.includes("saving scotland's red squirrels") ||
+      resourceName.includes("ssrs") ||
+      resourceName.includes("borders red squirrel") ||
+      resourceName.includes("saving scotlands red squirrels") ||
+      resourceName.includes("the scottish squirrel database");
+
+    const combinedText = `${rawName} ${remarks} ${resourceName} ${institution}`;
+
+    const hasTrappingKeywords = 
+      combinedText.includes('trap') || 
+      combinedText.includes('control') || 
+      combinedText.includes('effort') ||
+      combinedText.includes('catch') ||
+      combinedText.includes('dispatch') ||
+      combinedText.includes('despatch') ||
+      combinedText.includes('cull') ||
+      combinedText.includes('removal') ||
+      combinedText.includes('shoot') ||
+      combinedText.includes('shot') ||
+      combinedText.includes('kill') ||
+      combinedText.includes('euthaniz') ||
+      combinedText.includes('euthanis') ||
+      combinedText.includes('eradication') ||
+      combinedText.includes('rifle') ||
+      combinedText.includes('shooting') ||
+      combinedText.includes('managed') ||
+      combinedText.includes('humane') ||
+      combinedText.includes('station') ||
+      combinedText.includes('box') ||
+      combinedText.includes('tunnel') ||
+      institution.includes('forestry') ||
+      institution.includes('fls');
+
+    const actualSpecies = getActualSpecies(s);
+    const isGrid10km = Number(s.coordinateUncertaintyInMeters) === 7071.1 || (typeof s.gridReference === 'string' && s.gridReference.length === 4);
+    const isAbsent = String(s.occurrenceStatus).toLowerCase() === 'absent';
+    
+    if (actualSpecies === 'grey' && (isSSRSProject || isTrappingDataset || isGrid10km || hasTrappingKeywords || isAbsent)) {
+      s.isTrapping = true;
+    } else {
+      s.isTrapping = false;
+    }
+  } catch (err) {
+    if (s && typeof s === 'object') {
+      s.isTrapping = false;
+    }
+  }
   return true;
 };
+
+// Sequential Serialization Queue to prevent race conditions & write corruption
+let syncQueue: { species: 'red' | 'grey' | 'marten'; forceReset: boolean }[] = [];
+let isProcessingQueue = false;
+
+async function processSyncQueue() {
+  if (isProcessingQueue) return;
+  isProcessingQueue = true;
+  
+  while (syncQueue.length > 0) {
+    const task = syncQueue.shift();
+    if (task) {
+      try {
+        console.log(`[Queue] Starting queued sync for ${task.species} (forceReset: ${task.forceReset})`);
+        await fetchAllSightings(task.species, task.forceReset);
+      } catch (err: any) {
+        console.error(`[Queue] Error syncing ${task.species}:`, err.message);
+      }
+    }
+  }
+  isProcessingQueue = false;
+}
+
+function enqueueSync(species: 'red' | 'grey' | 'marten', forceReset: boolean = false) {
+  const alreadyInQueue = syncQueue.some(t => t.species === species);
+  const isCurrentlySyncing = syncStatus[species]?.isLoading;
+  
+  if (!alreadyInQueue && !isCurrentlySyncing) {
+    syncQueue.push({ species, forceReset });
+    console.log(`[Queue] Enqueued ${species} sync. Queue size: ${syncQueue.length}`);
+  }
+  processSyncQueue();
+}
 
 async function startServer() {
   try {
@@ -227,11 +530,13 @@ async function startServer() {
     const PORT = 3000;
 
     // Load initial data
+    await loadProgressFromFile();
     await loadDataFromFile();
 
     console.log(`[Server] Starting in ${process.env.NODE_ENV || 'development'} mode`);
 
-    app.use(express.json());
+    app.use(express.json({ limit: "200mb" }));
+    app.use(express.urlencoded({ limit: "200mb", extended: true }));
 
   // Log all API requests
   app.use("/api", (req, res, next) => {
@@ -253,146 +558,261 @@ async function startServer() {
     });
   });
 
-  // API Route to fetch bulk or filtered sightings
-  app.get("/api/sightings", async (req, res) => {
-    const { species, startYear, endYear, latMin, latMax, lonMin, lonMax, zoom, forceRefresh } = req.query;
-    
-    // Validate speciesKey
-    const speciesInQuery = species as string;
-    const speciesKey = (['red', 'grey', 'marten'].includes(speciesInQuery) ? speciesInQuery : 'red') as 'red' | 'grey' | 'marten';
+  // Database analysis report of datasets and references
+  app.get("/api/db-report", (req, res) => {
+    const report: Record<string, {
+      species: string;
+      resourceUid: string;
+      resourceName: string;
+      count: number;
+      trappingCount: number;
+    }> = {};
 
-  // Start background sync for species immediately if needed
-  const targetSpecies = Array.isArray(species) ? species : [species];
-  targetSpecies.forEach(async (s) => {
-    const sKey = s as 'red' | 'grey' | 'marten';
-    if (['red', 'grey', 'marten'].includes(sKey) && (!bulkStore[sKey] || bulkStore[sKey].length < 10 || forceRefresh === 'true')) {
-      fetchAllSightings(sKey, forceRefresh === 'true'); 
-    }
+    ['red', 'grey', 'marten'].forEach(species => {
+      const records = bulkStore[species] || [];
+      records.forEach(r => {
+        const uid = r.dataResourceUid || r.data_resource_uid || 'unknown_uid';
+        const name = r.dataResourceName || 'Unknown Resource';
+        const key = `${species}_${uid}`;
+        if (!report[key]) {
+          report[key] = {
+            species,
+            resourceUid: uid,
+            resourceName: name,
+            count: 0,
+            trappingCount: 0
+          };
+        }
+        report[key].count++;
+        if (r.isTrapping) {
+          report[key].trappingCount++;
+        }
+      });
+    });
+
+    res.json(Object.values(report).sort((a,b) => b.count - a.count));
   });
 
-  // Proceed with filtering current data
-  const responseSpecies = Array.isArray(species) ? species : [species];
-  const resultsBySpecies = await Promise.all(responseSpecies.map(async (s) => {
-    const sKey = (['red', 'grey', 'marten'].includes(s as string) ? s : 'red') as 'red' | 'grey' | 'marten';
-    let results = (bulkStore[sKey] || []).filter(isSSRS);
-
-    // 1. Time Filter
-    if (startYear || endYear) {
-      const start = parseInt(startYear as string) || 2008;
-      const end = parseInt(endYear as string) || new Date().getFullYear();
-      results = results.filter(s => s.year >= start && s.year <= end);
-    }
-
-    // 2. Bounds Filter
-    if (latMin && latMax && lonMin && lonMax) {
-      const l1 = parseFloat(latMin as string);
-      const l2 = parseFloat(latMax as string);
-      const ln1 = parseFloat(lonMin as string);
-      const ln2 = parseFloat(lonMax as string);
-      results = results.filter(s => {
-        const lat = parseFloat(s.decimalLatitude);
-        const lon = parseFloat(s.decimalLongitude);
-        return lat >= l1 && lat <= l2 && lon >= ln1 && lon <= ln2;
+  // API Route to fetch bulk or filtered sightings
+  app.get("/api/sightings", async (req, res, next) => {
+    try {
+      const { species, startYear, endYear, latMin, latMax, lonMin, lonMax, zoom, forceRefresh, groupName } = req.query;
+      
+      const responseSpecies = Array.isArray(species) ? species : (species ? [species] : ['red']);
+      
+      // Start background sync for species immediately if needed
+      responseSpecies.forEach((s) => {
+        const sQuery = s as string;
+        const sKey = (['red', 'grey', 'marten'].includes(sQuery) ? sQuery : (sQuery === 'grey_effort' ? 'grey' : null)) as 'red' | 'grey' | 'marten' | null;
+        
+        if (sKey && (bulkStore[sKey].length < 10 || forceRefresh === 'true')) {
+          enqueueSync(sKey, forceRefresh === 'true'); 
+        }
       });
-    }
-    return results;
-  }));
 
-  let results = resultsBySpecies.flat();
-  const totalCountInBounds = results.length;
-  const currentZoom = parseInt(zoom as string) || 10;
-    
-    // 3. Thinning Logic
-    // If zoomed in (e.g. village level) or if few records, don't thin
-    const shouldThin = totalCountInBounds > 10000 && currentZoom < 13;
-    const isThinned = shouldThin;
-    
-    if (shouldThin) {
-      const MAX_POINTS = 10000;
-      // Grid-based spatial sampling to preserve local clusters and geographic distribution
-      // Default bounding box or provided bounds
-      const minLat = latMin ? parseFloat(latMin as string) : 54.5;
-      const maxLat = latMax ? parseFloat(latMax as string) : 61.0;
-      const minLon = lonMin ? parseFloat(lonMin as string) : -8.5;
-      const maxLon = lonMax ? parseFloat(lonMax as string) : -0.5;
+      const group = groupName ? SQUIRREL_GROUPS.find(g => g.name === groupName) : null;
+
+      // Proceed with filtering current data
+      const resultsBySpecies = await Promise.all(responseSpecies.map(async (s) => {
+        const sQuery = s as string;
+        const sKey = (['red', 'grey', 'marten'].includes(sQuery) ? sQuery : (sQuery === 'grey_effort' ? 'grey' : 'red')) as 'red' | 'grey' | 'marten';
+        let results = (bulkStore[sKey] || []).filter((r) => {
+          isSSRS(r);
+          const actualSp = getActualSpecies(r);
+          if (sQuery === 'red') return actualSp === 'red';
+          if (sQuery === 'grey' || sQuery === 'grey_effort') return actualSp === 'grey';
+          if (sQuery === 'marten') return actualSp === 'marten';
+          return false;
+        });
+
+        if (sQuery === 'grey_effort') {
+          const trappingResults = results.filter(r => r.isTrapping === true);
+          const grouped: Record<string, any> = {};
+          trappingResults.forEach(r => {
+            const key = `${r.decimalLatitude},${r.decimalLongitude}`;
+            const count = parseInt(r.individualCount) || 1;
+            if (!grouped[key]) {
+              grouped[key] = { ...r, recordCount: count };
+            } else {
+              grouped[key].recordCount += count;
+              if (r.year > (grouped[key].year || 0)) {
+                grouped[key].year = r.year;
+                grouped[key].occurrenceDate = r.occurrenceDate;
+              }
+            }
+          });
+          results = Object.values(grouped);
+          console.log(`[Diagnostic] Grouped grey_effort: ${results.length} locations found.`);
+        }
+
+        // 1. Time Filter
+        if (startYear || endYear) {
+          const start = parseInt(startYear as string) || 2008;
+          const end = parseInt(endYear as string) || new Date().getFullYear();
+          results = results.filter(s => s.year >= start && s.year <= end);
+        }
+
+        // 2. Bounds or Group Filter
+        if (group) {
+          results = results.filter(s => {
+            const lat = parseFloat(s.decimalLatitude);
+            const lon = parseFloat(s.decimalLongitude);
+            return isPointInPolygon(lat, lon, group.polygon as [number, number][]);
+          });
+        } else if (latMin && latMax && lonMin && lonMax) {
+          const l1 = parseFloat(latMin as string);
+          const l2 = parseFloat(latMax as string);
+          const ln1 = parseFloat(lonMin as string);
+          const ln2 = parseFloat(lonMax as string);
+          results = results.filter(s => {
+            const lat = parseFloat(s.decimalLatitude);
+            const lon = parseFloat(s.decimalLongitude);
+            return lat >= l1 && lat <= l2 && lon >= ln1 && lon <= ln2;
+          });
+        }
+        return results.map(r => ({ ...r, speciesType: sQuery }));
+      }));
+
+      let results = resultsBySpecies.flat();
+      const totalCountIncluded = results.length;
+      const currentZoom = parseInt(zoom as string) || 10;
       
-      const gridSize = 60; 
-      const grid: Record<string, any[]> = {};
+      // 3. Thinning Logic
+      // If zoomed in (e.g. village level) or if few records, don't thin
+      const shouldThin = totalCountIncluded > 10000 && currentZoom < 13;
+      const isThinned = shouldThin;
       
-      for (const sighting of results) {
-        const lat = parseFloat(sighting.decimalLatitude);
-        const lon = parseFloat(sighting.decimalLongitude);
-        const x = Math.floor(((lat - minLat) / (maxLat - minLat)) * gridSize);
-        const y = Math.floor(((lon - minLon) / (maxLon - minLon)) * gridSize);
-        const cellKey = `${x},${y}`;
-        if (!grid[cellKey]) grid[cellKey] = [];
-        grid[cellKey].push(sighting);
-      }
-      
-      const sampled = [];
-      const cells = Object.values(grid);
-      const pointsPerCell = Math.max(1, Math.ceil(MAX_POINTS / cells.length));
-      
-      for (const cellRecords of cells) {
-        cellRecords.sort((a, b) => (b.year || 0) - (a.year || 0));
-        const toTake = Math.min(cellRecords.length, pointsPerCell);
-        for (let i = 0; i < toTake; i++) {
-          sampled.push(cellRecords[i]);
+      if (shouldThin) {
+        const MAX_POINTS = 10000;
+        // Grid-based spatial sampling
+        let minLat = latMin ? parseFloat(latMin as string) : 54.5;
+        let maxLat = latMax ? parseFloat(latMax as string) : 61.0;
+        let minLon = lonMin ? parseFloat(lonMin as string) : -8.5;
+        let maxLon = lonMax ? parseFloat(lonMax as string) : -0.5;
+
+        if (group) {
+          const lats = group.polygon.map(p => p[0]);
+          const lons = group.polygon.map(p => p[1]);
+          minLat = Math.min(...lats);
+          maxLat = Math.max(...lats);
+          minLon = Math.min(...lons);
+          maxLon = Math.max(...lons);
+        }
+        
+        const gridSize = 60; 
+        const grid: Record<string, any[]> = {};
+        
+        for (const sighting of results) {
+          const lat = parseFloat(sighting.decimalLatitude);
+          const lon = parseFloat(sighting.decimalLongitude);
+          const x = Math.floor(((lat - minLat) / (maxLat - minLat + 0.0001)) * gridSize);
+          const y = Math.floor(((lon - minLon) / (maxLon - minLon + 0.0001)) * gridSize);
+          const cellKey = `${x},${y}`;
+          if (!grid[cellKey]) grid[cellKey] = [];
+          grid[cellKey].push(sighting);
+        }
+        
+        const sampled = [];
+        const cells = Object.values(grid);
+        const pointsPerCell = Math.max(1, Math.ceil(MAX_POINTS / cells.length));
+        
+        for (const cellRecords of cells) {
+          cellRecords.sort((a, b) => (b.year || 0) - (a.year || 0));
+          const toTake = Math.min(cellRecords.length, pointsPerCell);
+          for (let i = 0; i < toTake; i++) {
+            sampled.push(cellRecords[i]);
+            if (sampled.length >= MAX_POINTS) break;
+          }
           if (sampled.length >= MAX_POINTS) break;
         }
-        if (sampled.length >= MAX_POINTS) break;
+        results = sampled;
       }
-      results = sampled;
-    }
 
-    res.json({
-      occurrences: results,
-      total: totalCountInBounds,
-      thinned: isThinned,
-      isSyncing: syncStatus[speciesKey]?.isLoading || false
-    });
+      const anySyncing = responseSpecies.some(s => {
+        const sQuery = s as string;
+        const sKey = (['red', 'grey', 'marten'].includes(sQuery) ? sQuery : (sQuery === 'grey_effort' ? 'grey' : null)) as 'red' | 'grey' | 'marten' | null;
+        return sKey && syncStatus[sKey]?.isLoading;
+      });
+
+      res.json({
+        occurrences: results,
+        total: totalCountIncluded,
+        thinned: isThinned,
+        isSyncing: anySyncing
+      });
+    } catch (err) {
+      next(err);
+    }
   });
 
-  app.get("/api/population-stats", async (req, res) => {
-    const { latMin, latMax, lonMin, lonMax, startYear, endYear } = req.query;
-    
-    const start = parseInt(startYear as string) || 2008;
-    const end = parseInt(endYear as string) || new Date().getFullYear();
-    
-    const stats: Record<number, { red: number; grey: number; marten: number }> = {};
-    for (let y = start; y <= end; y++) {
-      stats[y] = { red: 0, grey: 0, marten: 0 };
+  app.get("/api/population-stats", async (req, res, next) => {
+    try {
+      const { latMin, latMax, lonMin, lonMax, startYear, endYear, groupName } = req.query;
+      
+      const currentYear = new Date().getFullYear();
+      let start = parseInt(startYear as string) || 2008;
+      let end = parseInt(endYear as string) || currentYear;
+      
+      if (isNaN(start) || start < 1900) start = 2008;
+      if (isNaN(end) || end > currentYear + 2) end = currentYear;
+      if (end < start) {
+        const temp = start;
+        start = end;
+        end = temp;
+      }
+      
+      const stats: Record<number, { red: number; grey: number; grey_effort: number; marten: number }> = {};
+      for (let y = start; y <= end; y++) {
+        stats[y] = { red: 0, grey: 0, grey_effort: 0, marten: 0 };
+      }
+
+      const l1 = latMin ? parseFloat(latMin as string) : -90;
+      const l2 = latMax ? parseFloat(latMax as string) : 90;
+      const ln1 = lonMin ? parseFloat(lonMin as string) : -180;
+      const ln2 = lonMax ? parseFloat(lonMax as string) : 180;
+
+      const group = groupName ? SQUIRREL_GROUPS.find(g => g.name === groupName) : null;
+
+      const filterInBounds = (s: any) => {
+        const lat = parseFloat(s.decimalLatitude);
+        const lon = parseFloat(s.decimalLongitude);
+        const inTime = s.year >= start && s.year <= end;
+        
+        if (!(inTime && isSSRS(s))) return false;
+        
+        if (group) {
+          return isPointInPolygon(lat, lon, group.polygon as [number, number][]);
+        }
+        
+        const inBounds = lat >= l1 && lat <= l2 && lon >= ln1 && ln2 >= lon;
+        return inBounds;
+      };
+
+      bulkStore.red.filter(filterInBounds).forEach(s => {
+        const actualSp = getActualSpecies(s);
+        if (actualSp === 'red' && stats[s.year]) stats[s.year].red++;
+      });
+      bulkStore.grey.filter(filterInBounds).forEach(s => {
+        const actualSp = getActualSpecies(s);
+        if (actualSp === 'grey' && stats[s.year]) {
+          stats[s.year].grey++;
+          if (s.isTrapping) stats[s.year].grey_effort++;
+        }
+      });
+      bulkStore.marten.filter(filterInBounds).forEach(s => {
+        const actualSp = getActualSpecies(s);
+        if (actualSp === 'marten' && stats[s.year]) stats[s.year].marten++;
+      });
+
+      const timeline = Object.entries(stats).map(([year, counts]) => ({
+        year: parseInt(year),
+        ...counts
+      })).sort((a, b) => a.year - b.year);
+
+      res.json(timeline);
+    } catch (err) {
+      next(err);
     }
-
-    const l1 = latMin ? parseFloat(latMin as string) : -90;
-    const l2 = latMax ? parseFloat(latMax as string) : 90;
-    const ln1 = lonMin ? parseFloat(lonMin as string) : -180;
-    const ln2 = lonMax ? parseFloat(lonMax as string) : 180;
-
-    const filterInBounds = (s: any) => {
-      const lat = parseFloat(s.decimalLatitude);
-      const lon = parseFloat(s.decimalLongitude);
-      const inBounds = lat >= l1 && lat <= l2 && lon >= ln1 && lon <= ln2;
-      const inTime = s.year >= start && s.year <= end;
-      return inBounds && inTime && isSSRS(s);
-    };
-
-    bulkStore.red.filter(filterInBounds).forEach(s => {
-      if (stats[s.year]) stats[s.year].red++;
-    });
-    bulkStore.grey.filter(filterInBounds).forEach(s => {
-      if (stats[s.year]) stats[s.year].grey++;
-    });
-    bulkStore.marten.filter(filterInBounds).forEach(s => {
-      if (stats[s.year]) stats[s.year].marten++;
-    });
-
-    const timeline = Object.entries(stats).map(([year, counts]) => ({
-      year: parseInt(year),
-      ...counts
-    })).sort((a, b) => a.year - b.year);
-
-    res.json(timeline);
   });
 
   // API Route to export data source statistics as CSV
@@ -463,7 +883,7 @@ async function startServer() {
   app.get("/api/force-refresh", async (req, res) => {
     const { species } = req.query;
     if (species === "red" || species === "grey" || species === "marten") {
-      fetchAllSightings(species as 'red' | 'grey' | 'marten', true);
+      enqueueSync(species as 'red' | 'grey' | 'marten', true);
       res.json({ message: `Sync started for ${species}` });
     } else {
       res.status(400).json({ error: "Invalid species" });
@@ -481,6 +901,70 @@ async function startServer() {
       res.download(DATA_FILE, "scottish_squirrel_sightings.json");
     } else {
       res.status(404).json({ error: "Data file not found. Try syncing first." });
+    }
+  });
+
+  // End point to import/load a local copy of full database as JSON
+  app.post("/api/import", async (req, res) => {
+    try {
+      const data = req.body;
+      if (!data || typeof data !== 'object') {
+        return res.status(400).json({ error: "Invalid data. Expected a JSON object." });
+      }
+
+      const red = Array.isArray(data.red) ? data.red : [];
+      const grey = Array.isArray(data.grey) ? data.grey : [];
+      const marten = Array.isArray(data.marten) ? data.marten : [];
+
+      if (red.length === 0 && grey.length === 0 && marten.length === 0) {
+        return res.status(400).json({ error: "No records found in the uploaded file, or invalid JSON structure." });
+      }
+
+      // Update in-memory bulk store
+      bulkStore.red = red;
+      bulkStore.grey = grey;
+      bulkStore.marten = marten;
+
+      // Re-apply SSRS tagging logic to all imported records
+      ['red', 'grey', 'marten'].forEach(species => {
+        bulkStore[species].forEach(isSSRS);
+      });
+
+      // Maintain syncProgressStore since we imported a complete copy
+      const limitYear = new Date().getFullYear();
+      const allYears = [];
+      for (let y = 2000; y <= limitYear; y++) {
+        allYears.push(y);
+      }
+      
+      const tsNow = new Date().toISOString();
+      syncProgressStore.red = { completedYears: [...allYears], isComplete: true, lastSync: tsNow };
+      syncProgressStore.grey = { completedYears: [...allYears], isComplete: true, lastSync: tsNow };
+      syncProgressStore.marten = { completedYears: [...allYears], isComplete: true, lastSync: tsNow };
+      await saveProgressToFile();
+
+      // Save to server local disk/file
+      await saveDataToFile();
+
+      // Also reset/update syncStatus counts so frontend sees them immediately
+      syncStatus.red.count = bulkStore.red.length;
+      syncStatus.grey.count = bulkStore.grey.length;
+      syncStatus.marten.count = bulkStore.marten.length;
+
+      console.log(`[Import] Local copy successfully uploaded. New counts: red=${bulkStore.red.length}, grey=${bulkStore.grey.length}, marten=${bulkStore.marten.length}`);
+
+      res.json({
+        success: true,
+        message: "Database imported successfully!",
+        counts: {
+          red: bulkStore.red.length,
+          grey: bulkStore.grey.length,
+          marten: bulkStore.marten.length
+        }
+      });
+    } catch (err: any) {
+      console.error("[Import] Error loading local copy:", err);
+      res.status(500).json({ error: "Failed to import database", message: err.message });
     }
   });
 
@@ -514,16 +998,28 @@ async function startServer() {
     });
   }
 
-    // If we have very few records or no records, trigger a fresh sync in background
-    setTimeout(() => {
-      ['red', 'grey', 'marten'].forEach(species => {
-        const sKey = species as 'red' | 'grey' | 'marten';
-        if (bulkStore[sKey].length < 10) {
-          console.log(`[Server] Proactive sync for ${sKey} (current count: ${bulkStore[sKey].length})`);
-          fetchAllSightings(sKey);
+    // If we have very few records or no records, trigger a fresh sequential sync in background in development
+    if (process.env.NODE_ENV !== "production") {
+      setTimeout(() => {
+        try {
+          ['red', 'grey', 'marten'].forEach(species => {
+            const sKey = species as 'red' | 'grey' | 'marten';
+            if (!bulkStore || typeof bulkStore !== 'object') {
+              bulkStore = { red: [], grey: [], marten: [] };
+            }
+            if (!bulkStore[sKey] || !Array.isArray(bulkStore[sKey])) {
+              bulkStore[sKey] = [];
+            }
+            if (bulkStore[sKey].length < 10) {
+              console.log(`[Server] Proactive sync enqueue for ${sKey} (current count: ${bulkStore[sKey].length})`);
+              enqueueSync(sKey, false);
+            }
+          });
+        } catch (err) {
+          console.error("[Server] Error in proactive sync timer:", err);
         }
-      });
-    }, 5000);
+      }, 5000);
+    }
 
     app.listen(PORT, "0.0.0.0", () => {
       console.log(`[Server] Squirrel Explorer API running on port ${PORT}`);

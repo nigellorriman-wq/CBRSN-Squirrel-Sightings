@@ -5,11 +5,13 @@ export interface Sighting {
   id: string;
   decimalLatitude: string;
   decimalLongitude: string;
-  year: string;
+  year: number;
   species?: string;
   raw_commonName?: string;
   occurrenceDate?: string;
   dataResourceName?: string;
+  isTrapping?: boolean;
+  gridReference?: string;
 }
 
 export interface SightingsResponse {

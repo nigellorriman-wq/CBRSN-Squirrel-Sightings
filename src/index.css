@@ -16,3 +16,18 @@
   transform: scale(1.5);
   cursor: pointer;
 }
+
+/* Square marker style for trapping effort */
+.trapping-marker-square {
+  background: transparent !important;
+  border: none !important;
+  border-radius: 0;
+  display: flex !important;
+  align-items: center;
+  justify-content: center;
+}
+
+.trapping-marker-square:hover {
+  transform: scale(1.2);
+  z-index: 1000 !important;
+}

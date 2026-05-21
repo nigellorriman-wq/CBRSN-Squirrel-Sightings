@@ -1,7 +1,8 @@
-import { useEffect, useState, useMemo } from 'react';
-import { MapContainer, TileLayer, CircleMarker, Tooltip, ZoomControl, useMapEvents, Polygon } from 'react-leaflet';
+import { useEffect, useState, useMemo, ChangeEvent } from 'react';
+import { MapContainer, TileLayer, CircleMarker, Tooltip, ZoomControl, useMapEvents, Polygon, Marker } from 'react-leaflet';
+import L from 'leaflet';
 import { motion, AnimatePresence } from 'motion/react';
-import { Filter, Calendar, Info, Layers, ChevronRight, ChevronLeft, MapPin, ZoomIn, Download, TrendingUp, BarChart3 } from 'lucide-react';
+import { Filter, Calendar, Info, Layers, ChevronRight, ChevronLeft, MapPin, ZoomIn, Download, Upload, TrendingUp, BarChart3 } from 'lucide-react';
 import { Sighting } from './types';
 import { SQUIRREL_GROUPS } from './groups_data';
 import { 
@@ -16,6 +17,7 @@ import {
 } from 'recharts';
 import logo from './assets/images/cb_red_squirrel_network_logo_transparent_1779031828830.png';
 import 'leaflet/dist/leaflet.css';
+import { latLonToEastingNorthing, eastingNorthingToLatLon, get100kmSquareLetters, getContourColor } from './osGridUtils';
 
 const SCOTTISH_BORDERS_CENTER: [number, number] = [55.5486, -2.7828];
 
@@ -31,7 +33,7 @@ const SOURCE_COLORS: Record<string, string> = {
 };
 
 function getTemporalColor(dateStr: string | undefined, year: string): string {
-  const startYear = 2008;
+  const startYear = 2000;
   const now = new Date();
   const currentYear = now.getFullYear();
   const currentMonth = now.getMonth();
@@ -165,8 +167,8 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [isThinned, setIsThinned] = useState(false);
   const [totalRecords, setTotalRecords] = useState(0);
-  const [species, setSpecies] = useState<('red' | 'grey' | 'marten')[]>(['red']);
-  const [startYear, setStartYear] = useState(2008);
+  const [species, setSpecies] = useState<('red' | 'grey' | 'grey_effort' | 'marten')[]>(['red']);
+  const [startYear, setStartYear] = useState(2000);
   const [endYear, setEndYear] = useState(new Date().getFullYear());
   const [markerScale, setMarkerScale] = useState(1);
   const [markerShape, setMarkerShape] = useState<'circle' | 'square'>('circle');
@@ -232,63 +234,105 @@ export default function App() {
       setLoading(true);
       try {
         const results = await Promise.all(species.map(async (s) => {
-          const query = new URLSearchParams({
+          const params: Record<string, string> = {
             species: s,
             startYear: debouncedRange.start.toString(),
             endYear: debouncedRange.end.toString(),
-          });
+          };
 
-          if (debouncedBounds) {
-            query.append('latMin', debouncedBounds.latMin.toString());
-            query.append('latMax', debouncedBounds.latMax.toString());
-            query.append('lonMin', debouncedBounds.lonMin.toString());
-            query.append('lonMax', debouncedBounds.lonMax.toString());
-            query.append('zoom', mapZoom.toString());
+          if (selectedGroup) {
+            params.groupName = selectedGroup;
           }
 
-          const response = await fetch(`/api/sightings?${query}`);
-          if (!response.ok) throw new Error('API Error');
-          const data = await response.json();
-          return (data.occurrences || []).map((occ: any) => ({ ...occ, speciesType: s }));
+          if (debouncedBounds) {
+            params.latMin = debouncedBounds.latMin.toString();
+            params.latMax = debouncedBounds.latMax.toString();
+            params.lonMin = debouncedBounds.lonMin.toString();
+            params.lonMax = debouncedBounds.lonMax.toString();
+            params.zoom = mapZoom.toString();
+          }
+
+          const query = new URLSearchParams(params);
+          try {
+            const response = await fetch(`/api/sightings?${query}`);
+            if (!response.ok) {
+              console.warn(`[Sightings] Fetch warning: HTTP status ${response.status} for ${s}`);
+              return { occurrences: [], total: 0, thinned: false };
+            }
+            
+            const contentType = response.headers.get("content-type");
+            if (!contentType || !contentType.includes("application/json")) {
+              console.warn(`[Sightings] Fetch warning: received non-JSON response for ${s}`);
+              return { occurrences: [], total: 0, thinned: false };
+            }
+
+            const data = await response.json();
+            return {
+              occurrences: (data.occurrences || []).map((occ: any) => ({ ...occ, speciesType: s })),
+              total: data.total || 0,
+              thinned: data.thinned || false
+            };
+          } catch (e: any) {
+            console.warn(`[Sightings] Transient network/parse error for ${s}:`, e.message);
+            return { occurrences: [], total: 0, thinned: false };
+          }
         }));
 
-        const merged = results.flat();
-        setSightings(merged);
-        setTotalRecords(merged.length);
-        setIsThinned(merged.length > 5000);
+        const mergedOccurrences = results.flatMap(r => r.occurrences);
+        const mergedTotal = results.reduce((sum, r) => sum + r.total, 0);
+        const mergedThinned = results.some(r => r.thinned);
+
+        setSightings(mergedOccurrences);
+        setTotalRecords(mergedTotal);
+        setIsThinned(mergedThinned);
       } catch (error) {
-        console.error('Fetch error:', error);
+        console.warn('Fetch error:', error);
       } finally {
         setLoading(false);
       }
     }
     fetchData();
-  }, [species, debouncedRange.start, debouncedRange.end, debouncedBounds, mapZoom, isSyncing, syncTick]);
+  }, [species, debouncedRange.start, debouncedRange.end, debouncedBounds, mapZoom, isSyncing, syncTick, selectedGroup]);
 
   useEffect(() => {
     async function fetchStats() {
       if (!debouncedBounds) return;
       setLoadingStats(true);
       try {
-        const query = new URLSearchParams({
+        const params: Record<string, string> = {
           latMin: debouncedBounds.latMin.toString(),
           latMax: debouncedBounds.latMax.toString(),
           lonMin: debouncedBounds.lonMin.toString(),
           lonMax: debouncedBounds.lonMax.toString(),
           startYear: debouncedRange.start.toString(),
           endYear: debouncedRange.end.toString(),
-        });
+        };
+        if (selectedGroup) {
+          params.groupName = selectedGroup;
+        }
+        const query = new URLSearchParams(params);
         const res = await fetch(`/api/population-stats?${query}`);
+        if (!res.ok) {
+          console.warn(`[Stats] Fetch warning: HTTP status ${res.status}`);
+          return;
+        }
+        
+        const contentType = res.headers.get("content-type");
+        if (!contentType || !contentType.includes("application/json")) {
+          console.warn(`[Stats] Fetch warning: received non-JSON response`);
+          return;
+        }
+
         const data = await res.json();
         setPopulationTimeline(data);
-      } catch (err) {
-        console.error("Stats fetch error:", err);
+      } catch (err: any) {
+        console.warn("Stats fetch warning:", err.message);
       } finally {
         setLoadingStats(false);
       }
     }
     fetchStats();
-  }, [debouncedBounds, debouncedRange.start, debouncedRange.end]);
+  }, [debouncedBounds, debouncedRange.start, debouncedRange.end, selectedGroup]);
 
   useEffect(() => {
     let interval: any;
@@ -296,45 +340,56 @@ export default function App() {
     const checkStatus = async () => {
       try {
         const res = await fetch('/api/sync-status');
-        if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
+        if (!res.ok) {
+          console.warn(`[Sync Status] Fetch warning: HTTP status ${res.status}`);
+          return;
+        }
+        
+        const contentType = res.headers.get("content-type");
+        if (!contentType || !contentType.includes("application/json")) {
+          console.warn(`[Sync Status] Fetch warning: received non-JSON response`);
+          return;
+        }
+
         const data = await res.json();
         
         if (data && typeof data === 'object') {
           setSyncStatusMap(data);
           
-          // Status for all species - handle missing data gracefully
           const redLoading = data.red?.isLoading || false;
           const greyLoading = data.grey?.isLoading || false;
           const martenLoading = data.marten?.isLoading || false;
           const currentlyLoading = redLoading || greyLoading || martenLoading;
           
-          // Update progress for all species (aggregate)
-          const activeS = data.red?.isLoading ? data.red : (data.grey?.isLoading ? data.grey : data.marten);
-          const aggregateProgress = {
-            count: (data.red?.count || 0) + (data.grey?.count || 0) + (data.marten?.count || 0),
-            totalEstimated: (data.red?.totalEstimated || 0) + (data.grey?.totalEstimated || 0) + (data.marten?.totalEstimated || 0),
-            isLoading: currentlyLoading,
-            phase: activeS?.phase || 'idle',
-            currentYear: activeS?.currentYear
-          };
-          setSyncProgress(aggregateProgress as any);
+          let activeS = null;
+          if (redLoading) activeS = data.red;
+          else if (greyLoading) activeS = data.grey;
+          else if (martenLoading) activeS = data.marten;
+
+          if (activeS) {
+            const aggregateProgress = {
+              count: (data.red?.count || 0) + (data.grey?.count || 0) + (data.marten?.count || 0),
+              totalEstimated: (data.red?.totalEstimated || 0) + (data.grey?.totalEstimated || 0) + (data.marten?.totalEstimated || 0),
+              isLoading: true,
+              phase: activeS.phase,
+              currentYear: activeS.currentYear
+            };
+            setSyncProgress(aggregateProgress);
+          } else {
+            setSyncProgress(null);
+          }
           
           setIsSyncing(currentlyLoading);
         }
-      } catch (err) {
-        console.error('Sync status check error:', err);
-        // Only stop syncing on fatal network errors, not on transient check errors
+      } catch (err: any) {
+        console.warn('Sync status check warning:', err.message);
       }
     };
 
-    if (isSyncing) {
-      checkStatus(); // Check immediately
-      interval = setInterval(checkStatus, 2000);
-    } else {
-      setSyncProgress(null);
-    }
+    checkStatus();
+    interval = setInterval(checkStatus, 3000); // Polling every 3s keeps the client updated organically
     return () => clearInterval(interval);
-  }, [isSyncing, species, debouncedRange.start, debouncedRange.end]);
+  }, []);
 
   // Memoized Map Markers to prevent re-renders during map move/sidebar toggle
   const filteredSightings = useMemo(() => {
@@ -349,9 +404,122 @@ export default function App() {
     });
   }, [sightings, selectedGroup]);
 
+  const { aggregatedSquares, maxCount } = useMemo(() => {
+    const squares: Record<string, {
+      easting: number;
+      northing: number;
+      count: number;
+      records: any[];
+      corners: [number, number][];
+    }> = {};
+
+    filteredSightings.forEach(s => {
+      const sType = (s as any).speciesType;
+      if (sType !== 'grey_effort' && !(sType === 'grey' && s.isTrapping)) return;
+
+      const lat = parseFloat(s.decimalLatitude);
+      const lon = parseFloat(s.decimalLongitude);
+      if (isNaN(lat) || isNaN(lon)) return;
+
+      const { Easting, Northing } = latLonToEastingNorthing(lat, lon);
+      const E_sw = Math.floor(Easting / 5000) * 5000;
+      const N_sw = Math.floor(Northing / 5000) * 5000;
+      
+      const key = `${E_sw}_${N_sw}`;
+      const count = (s as any).recordCount || 1;
+
+      if (!squares[key]) {
+        const sw = eastingNorthingToLatLon(E_sw, N_sw);
+        const se = eastingNorthingToLatLon(E_sw + 5000, N_sw);
+        const ne = eastingNorthingToLatLon(E_sw + 5000, N_sw + 5000);
+        const nw = eastingNorthingToLatLon(E_sw, N_sw + 5000);
+
+        squares[key] = {
+          easting: E_sw,
+          northing: N_sw,
+          count: 0,
+          records: [],
+          corners: [
+            [sw.lat, sw.lon],
+            [se.lat, se.lon],
+            [ne.lat, ne.lon],
+            [nw.lat, nw.lon]
+          ]
+        };
+      }
+
+      squares[key].count += count;
+      squares[key].records.push(s);
+    });
+
+    const squareList = Object.values(squares);
+    const maxVal = Math.max(1, ...squareList.map(s => s.count));
+    return { aggregatedSquares: squareList, maxCount: maxVal };
+  }, [filteredSightings]);
+
   const markerLayers = useMemo(() => {
-    return filteredSightings.map((sighting, index) => {
-      const sType = (sighting as any).speciesType;
+    return filteredSightings
+      .filter(sighting => {
+        const sType = (sighting as any).speciesType;
+        return sType !== 'grey_effort' && !(sType === 'grey' && sighting.isTrapping);
+      })
+      .map((sighting, index) => {
+        const sType = (sighting as any).speciesType;
+      
+      // Force label if it's trapping effort
+      const label = (sType === 'grey_effort' || sighting.isTrapping) ? 'Grey Squirrel Trapping' : (sighting.raw_commonName || (sType === 'red' ? 'Red Squirrel' : sType === 'grey' ? 'Grey Squirrel' : 'Pine Marten'));
+
+      if (sType === 'grey_effort' || (sType === 'grey' && sighting.isTrapping)) {
+        // Render as a square using Marker + divIcon
+        const count = (sighting as any).recordCount || 1;
+        const size = Math.max(12, 8 * markerScale);
+        
+        const icon = L.divIcon({
+          className: 'trapping-marker-square',
+          iconSize: [size, size],
+          iconAnchor: [size/2, size/2],
+          html: `<div style="width:${size}px; height:${size}px; background-color:#fab005; border:2px solid #c48a04; display:flex; align-items:center; justify-content:center; color:#78350f; font-size:${Math.max(7, size/2.2)}px; font-weight:900; font-family:sans-serif;">${count > 1 ? count : ''}</div>`
+        });
+
+        return (
+          <Marker
+            key={`${sighting.id}-${index}`}
+            position={[parseFloat(sighting.decimalLatitude), parseFloat(sighting.decimalLongitude)]}
+            icon={icon}
+            zIndexOffset={1000}
+          >
+            <Tooltip direction="top" offset={[0, -5]} opacity={1}>
+              <div className="font-sans px-2 py-1 min-w-[120px]">
+                <p className="font-bold text-stone-900 border-b border-stone-100 mb-1 pb-1">
+                  {label}
+                  <span className="ml-2 px-1 bg-amber-100 text-amber-700 text-[8px] rounded uppercase font-bold tracking-tighter">Trapping Effort</span>
+                </p>
+                <div className="flex justify-between items-center text-[10px] text-stone-500 font-semibold mb-1">
+                  <span>RECORDS</span>
+                  <span className="text-amber-700 font-bold">{count}</span>
+                </div>
+                <div className="flex justify-between items-center text-[10px] text-stone-500 font-semibold mb-1">
+                  <span>LAST ACTIVITY</span>
+                  <span className="text-stone-900">{sighting.year}</span>
+                </div>
+                {sighting.occurrenceDate && (
+                  <div className="flex justify-between items-center text-[10px] text-stone-500 font-semibold mb-1">
+                    <span>DATE</span>
+                    <span className="text-stone-900">{new Date(sighting.occurrenceDate).toLocaleDateString()}</span>
+                  </div>
+                )}
+                {sighting.dataResourceName && (
+                  <div className="pt-1 mt-1 border-t border-stone-100">
+                    <p className="text-[8px] text-stone-400 font-bold uppercase tracking-tighter mb-0.5">DATA PROVIDER</p>
+                    <p className="text-[10px] text-stone-600 font-medium leading-tight">{sighting.dataResourceName}</p>
+                  </div>
+                )}
+              </div>
+            </Tooltip>
+          </Marker>
+        );
+      }
+
       return (
         <CircleMarker
           key={`${sighting.id}-${index}`}
@@ -359,10 +527,10 @@ export default function App() {
           radius={4 * markerScale}
           pathOptions={{
             fillColor: colorMode === 'temporal' 
-              ? getTemporalColor(sighting.occurrenceDate, sighting.year) 
-              : (sType === 'red' ? '#dc2626' : sType === 'grey' ? '#78716c' : '#713f12'),
-            color: sType === 'red' ? '#dc2626' : sType === 'grey' ? '#78716c' : '#713f12',
-            weight: sType === 'marten' ? 4 : 2.5, // Thicker stroke for Marten (brown circle around)
+              ? getTemporalColor(sighting.occurrenceDate, sighting.year.toString()) 
+              : (sType === 'red' ? '#dc2626' : sType === 'grey' ? '#78716c' : sType === 'grey_effort' ? '#eab308' : '#713f12'),
+            color: sType === 'red' ? '#dc2626' : sType === 'grey' ? '#78716c' : sType === 'grey_effort' ? '#eab308' : '#713f12',
+            weight: (sType === 'marten' || sType === 'grey_effort') ? 4 : 2.5, 
             opacity: 1,
             fillOpacity: 0.9,
             stroke: true
@@ -372,7 +540,8 @@ export default function App() {
           <Tooltip direction="top" offset={[0, -5]} opacity={1}>
             <div className="font-sans px-2 py-1 min-w-[120px]">
               <p className="font-bold text-stone-900 border-b border-stone-100 mb-1 pb-1">
-                {sighting.raw_commonName || (sType === 'red' ? 'Red Squirrel' : sType === 'grey' ? 'Grey Squirrel' : 'Pine Marten')}
+                {label}
+                {sighting.isTrapping && <span className="ml-2 px-1 bg-amber-100 text-amber-700 text-[8px] rounded uppercase font-bold tracking-tighter">Trapping Effort</span>}
               </p>
               <div className="flex justify-between items-center text-[10px] text-stone-500 font-semibold mb-1">
                 <span>YEAR</span>
@@ -454,6 +623,60 @@ export default function App() {
     }
   };
 
+  const handleLocalImport = async (e: ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setLoading(true);
+    try {
+      const text = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result as string);
+        reader.onerror = reject;
+        reader.readAsText(file);
+      });
+
+      // Simple frontend verification
+      let parsed;
+      try {
+        parsed = JSON.parse(text);
+      } catch (err) {
+        throw new Error('Invalid JSON format. Please ensure you are loading a valid exported JSON database file.');
+      }
+
+      const hasRed = Array.isArray(parsed.red);
+      const hasGrey = Array.isArray(parsed.grey);
+      const hasMarten = Array.isArray(parsed.marten);
+
+      if (!hasRed && !hasGrey && !hasMarten) {
+        throw new Error('Invalid database structure. The file must contain red, grey, or marten records.');
+      }
+
+      const response = await fetch('/api/import', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: text
+      });
+
+      if (!response.ok) {
+        const errData = await response.json();
+        throw new Error(errData.error || 'Failed to import the local copy.');
+      }
+
+      const result = await response.json();
+      alert(result.message || 'Database imported successfully! The page will now reload to display the imported local copy data.');
+      window.location.reload();
+    } catch (err: any) {
+      console.error('Import error:', err);
+      alert(err.message || 'An error occurred during import.');
+    } finally {
+      setLoading(false);
+      e.target.value = '';
+    }
+  };
+
   return (
     <div className="h-screen flex flex-col bg-stone-50 overflow-hidden font-sans text-stone-900">
       {/* Header */}
@@ -524,7 +747,7 @@ export default function App() {
                   <h3 className="text-xs font-bold text-stone-400 uppercase tracking-widest mb-4 flex items-center gap-2">
                     <Filter className="w-3 h-3" /> Species Filter
                   </h3>
-                  <div className="grid grid-cols-3 gap-2 bg-stone-100 p-1 rounded-2xl">
+              <div className="grid grid-cols-2 gap-2 bg-stone-100 p-1 rounded-2xl">
                     <button
                       onClick={() => {
                         setSpecies(prev => {
@@ -560,6 +783,24 @@ export default function App() {
                       }`}
                     >
                       Grey
+                    </button>
+                    <button
+                      onClick={() => {
+                        setSpecies(prev => {
+                          if (prev.includes('grey_effort')) {
+                            if (prev.length === 1) return prev;
+                            return prev.filter(s => s !== 'grey_effort');
+                          }
+                          return [...prev, 'grey_effort'];
+                        });
+                      }}
+                      className={`py-2.5 rounded-xl text-[10px] font-bold transition-all uppercase tracking-tight ${
+                        species.includes('grey_effort') 
+                        ? 'bg-yellow-500 text-white shadow-md' 
+                        : 'bg-white text-stone-500 hover:text-stone-700'
+                      }`}
+                    >
+                      Grey (Trapping)
                     </button>
                     <button
                       onClick={() => {
@@ -719,12 +960,13 @@ export default function App() {
                         />
                         <Line type="monotone" dataKey="red" stroke="#ef4444" strokeWidth={2} dot={{ r: 2 }} activeDot={{ r: 4 }} />
                         <Line type="monotone" dataKey="grey" stroke="#78716c" strokeWidth={2} dot={{ r: 2 }} activeDot={{ r: 4 }} />
+                        <Line type="monotone" dataKey="grey_effort" stroke="#eab308" strokeWidth={2} strokeDasharray="5 5" dot={{ r: 2 }} activeDot={{ r: 4 }} />
                         <Line type="monotone" dataKey="marten" stroke="#713f12" strokeWidth={2} dot={{ r: 2 }} activeDot={{ r: 4 }} />
                       </LineChart>
                     </ResponsiveContainer>
                   </div>
                   
-                  <div className="grid grid-cols-3 gap-2 px-1 text-center">
+                  <div className="grid grid-cols-4 gap-2 px-1 text-center">
                     <div className="flex flex-col">
                       <span className="text-[8px] text-stone-400 font-bold uppercase tracking-wider">Red</span>
                       <span className="text-xs font-bold text-red-600">
@@ -738,6 +980,12 @@ export default function App() {
                       </span>
                     </div>
                     <div className="flex flex-col">
+                      <span className="text-[8px] text-stone-400 font-bold uppercase tracking-wider">Effort</span>
+                      <span className="text-xs font-bold text-yellow-600">
+                        {populationTimeline.reduce((sum, d) => sum + d.grey_effort, 0).toLocaleString()}
+                      </span>
+                    </div>
+                    <div className="flex flex-col">
                       <span className="text-[8px] text-stone-400 font-bold uppercase tracking-wider">Marten</span>
                       <span className="text-xs font-bold text-[#713f12]">
                         {populationTimeline.reduce((sum, d) => (sum + (d.marten || 0)), 0).toLocaleString()}
@@ -748,7 +996,7 @@ export default function App() {
                   {populationTimeline.length > 2 && (
                     <div className="bg-stone-50 rounded-lg p-2.5 border border-stone-100">
                       <p className="text-[9px] text-stone-500 leading-normal italic">
-                        Based on the current view, sightings for <strong>{species.join(' & ')}</strong> have changed by 
+                        Based on the current {selectedGroup ? 'area' : 'view'}, sightings for <strong>{species.join(' & ')}</strong> have changed by 
                         <span className="font-bold text-stone-900 border-b border-stone-300 ml-1">
                           {(() => {
                             const primarySpecies = species[0] || 'red';
@@ -807,7 +1055,7 @@ export default function App() {
                     </div>
 
                     <div className="space-y-2 pt-2">
-                      <label className="text-[10px] font-bold text-stone-500 uppercase tracking-wider">Coloring Mode</label>
+                      <label className="text-[10px] font-bold text-stone-500 uppercase tracking-wider">Colouring Mode</label>
                       <div className="grid grid-cols-2 gap-2">
                         <button
                           onClick={() => setColorMode('temporal')}
@@ -862,41 +1110,63 @@ export default function App() {
                     Fetching from <strong>Saving Scotland's Red Squirrels</strong> database via NBN Atlas.
                   </p>
 
-                  {syncStatusMap[species[0]]?.lastSync && (
+                  {syncStatusMap[species[0] === 'grey_effort' ? 'grey' : species[0]]?.lastSync && (
                     <div className="pt-1 mt-1 border-t border-amber-200 text-[9px] text-amber-600 font-bold">
-                      DATABASE LAST SYNCED: {new Date(syncStatusMap[species[0]].lastSync).toLocaleString()}
+                      DATABASE SNAPSHOT DATE: {new Date(syncStatusMap[species[0] === 'grey_effort' ? 'grey' : species[0]].lastSync).toLocaleString()}
+                    </div>
+                  )}
+
+                  {import.meta.env.PROD && (
+                    <div className="pt-1 mt-1 text-[9px] text-stone-600 font-medium border-t border-amber-200/50">
+                      Note: Using a high-performance local snapshot of the database bundled directly in the app build.
                     </div>
                   )}
                 </div>
               </div>
 
-              <div className="p-6 bg-stone-50 border-t border-stone-200 space-y-3">
-                <button 
-                  onClick={refreshData}
-                  disabled={isSyncing}
-                  className={`w-full py-3 border rounded-xl text-xs font-bold transition-all active:scale-95 flex items-center justify-center gap-2 shadow-sm hover:shadow-md ${
-                    isSyncing 
-                    ? 'bg-amber-50 border-amber-200 text-amber-700 cursor-not-allowed' 
-                    : 'bg-white border-stone-200 text-stone-600 hover:bg-stone-100'
-                  }`}
-                >
-                  {isSyncing ? (
-                    <>
-                      <div className="w-3 h-3 border-2 border-amber-600 border-t-transparent rounded-full animate-spin" />
-                      FETCHING {((syncStatusMap.red?.count || 0) + (syncStatusMap.grey?.count || 0) + (syncStatusMap.marten?.count || 0)).toLocaleString()} / {((syncStatusMap.red?.totalEstimated || 0) + (syncStatusMap.grey?.totalEstimated || 0) + (syncStatusMap.marten?.totalEstimated || 0)).toLocaleString()}
-                    </>
-                  ) : (
-                    'SYNC WITH NBN ATLAS'
-                  )}
-                </button>
-                <button 
-                  onClick={() => handleDownload('json')}
-                  className="w-full py-3 bg-stone-900 text-white rounded-xl text-xs font-bold shadow-sm hover:shadow-lg hover:bg-black transition-all active:scale-95 flex items-center justify-center gap-2"
-                >
-                  <Download className="w-3.5 h-3.5" />
-                  EXPORT DATABASE (.JSON)
-                </button>
-              </div>
+              {!import.meta.env.PROD && (
+                <div className="p-6 bg-stone-50 border-t border-stone-200 space-y-3">
+                  <button 
+                    onClick={refreshData}
+                    disabled={isSyncing}
+                    className={`w-full py-3 border rounded-xl text-xs font-bold transition-all active:scale-95 flex items-center justify-center gap-2 shadow-sm hover:shadow-md ${
+                      isSyncing 
+                      ? 'bg-amber-50 border-amber-200 text-amber-700 cursor-not-allowed' 
+                      : 'bg-white border-stone-200 text-stone-600 hover:bg-stone-100'
+                    }`}
+                  >
+                    {isSyncing ? (
+                      <>
+                        <div className="w-3 h-3 border-2 border-amber-600 border-t-transparent rounded-full animate-spin" />
+                        FETCHING {((syncStatusMap.red?.count || 0) + (syncStatusMap.grey?.count || 0) + (syncStatusMap.marten?.count || 0)).toLocaleString()} / {((syncStatusMap.red?.totalEstimated || 0) + (syncStatusMap.grey?.totalEstimated || 0) + (syncStatusMap.marten?.totalEstimated || 0)).toLocaleString()}
+                      </>
+                    ) : (
+                      'SYNC WITH NBN ATLAS'
+                    )}
+                  </button>
+                  <button 
+                    onClick={() => handleDownload('json')}
+                    className="w-full py-3 bg-stone-900 text-white rounded-xl text-xs font-bold shadow-sm hover:shadow-lg hover:bg-black transition-all active:scale-95 flex items-center justify-center gap-2"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    EXPORT DATABASE (.JSON)
+                  </button>
+                  <button 
+                    onClick={() => document.getElementById('local-db-upload')?.click()}
+                    className="w-full py-3 bg-amber-600 hover:bg-amber-700 text-white rounded-xl text-xs font-bold shadow-sm hover:shadow-lg transition-all active:scale-95 flex items-center justify-center gap-2"
+                  >
+                    <Upload className="w-3.5 h-3.5" />
+                    LOAD LOCAL COPY (from Downloads)
+                  </button>
+                  <input 
+                    id="local-db-upload"
+                    type="file"
+                    accept=".json"
+                    onChange={handleLocalImport}
+                    className="hidden"
+                  />
+                </div>
+              )}
             </motion.aside>
           )}
         </AnimatePresence>
@@ -951,6 +1221,54 @@ export default function App() {
               </Polygon>
             ))}
 
+            {species.includes('grey_effort') && aggregatedSquares.map((square, index) => {
+              const maxVal = maxCount;
+              const style = getContourColor(square.count, maxVal);
+              const gridLetters = get100kmSquareLetters(square.easting, square.northing);
+              const eDigits = Math.floor((square.easting % 100000) / 1000).toString().padStart(2, '0');
+              const nDigits = Math.floor((square.northing % 100000) / 1000).toString().padStart(2, '0');
+              const gridRefLabel = `${gridLetters} ${eDigits} ${nDigits}`;
+
+              return (
+                <Polygon
+                  key={`grid-square-${index}`}
+                  positions={square.corners}
+                  pathOptions={{
+                    fillColor: style.fillColor,
+                    fillOpacity: style.fillOpacity,
+                    color: style.color,
+                    weight: style.weight,
+                    opacity: 0.8
+                  }}
+                >
+                  <Tooltip sticky>
+                    <div className="font-sans px-2 py-1 min-w-[140px]">
+                      <p className="font-bold text-stone-900 border-b border-stone-100 mb-1 pb-1 flex items-center justify-between">
+                        <span>OS Grid 5km Square</span>
+                        <span className="px-1.5 py-0.5 bg-amber-100 text-amber-800 text-[8px] rounded font-mono uppercase tracking-tight">trapping</span>
+                      </p>
+                      <div className="flex justify-between items-center text-[10px] text-stone-500 font-semibold mb-1">
+                        <span>GRID REF</span>
+                        <span className="text-stone-900 font-bold font-mono">{gridRefLabel}</span>
+                      </div>
+                      <div className="flex justify-between items-center text-[10px] text-stone-500 font-semibold mb-1">
+                        <span>EAS/NOR (SW)</span>
+                        <span className="text-stone-500 font-mono text-[9px]">{square.easting.toLocaleString()}e, {square.northing.toLocaleString()}n</span>
+                      </div>
+                      <div className="flex justify-between items-center text-[10px] text-stone-500 font-semibold mb-1">
+                        <span>RECORDS</span>
+                        <span className="text-amber-700 font-bold">{square.count} Records</span>
+                      </div>
+                      <div className="flex justify-between items-center text-[10px] text-stone-500 font-semibold">
+                        <span>ACTIVE YEARS</span>
+                        <span className="text-stone-900">{startYear === endYear ? startYear : `${startYear} - ${endYear}`}</span>
+                      </div>
+                    </div>
+                  </Tooltip>
+                </Polygon>
+              );
+            })}
+
             {markerLayers}
           </MapContainer>
 
@@ -960,13 +1278,13 @@ export default function App() {
               <div className="space-y-2 border-b border-stone-100 pb-2">
                 <div className="flex items-center justify-between gap-4">
                   <span className="text-[10px] font-bold text-stone-900 uppercase tracking-widest">
-                    {species.map(s => s === 'red' ? 'Red' : s === 'grey' ? 'Grey' : 'Marten').join(' + ')}
+                    {species.map(s => s === 'red' ? 'Red' : s === 'grey' ? 'Grey' : s === 'grey_effort' ? 'Grey Trapping' : 'Marten').join(' + ')}
                   </span>
                   <div className={`w-3 h-3 rounded-${markerShape === 'circle' ? 'full' : 'sm'} bg-stone-900 shadow-sm border border-white`} />
                 </div>
                 <div className="space-y-1">
                   <p className="text-[8px] font-bold text-stone-400 uppercase tracking-tighter">
-                    {colorMode === 'temporal' ? 'Timeline (2008 - Present)' : 'Species Colors'}
+                    {colorMode === 'temporal' ? 'Timeline (2008 - Present)' : 'Species Colours'}
                   </p>
                   {colorMode === 'temporal' ? (
                     <>
@@ -990,6 +1308,11 @@ export default function App() {
                           <span className="text-[9px] font-bold text-stone-600 uppercase tracking-widest">Grey Squirrel</span>
                         </div>
                       )}
+                      {species.includes('grey_effort') && (
+                        <div className="flex items-center gap-2">
+                          <span className="text-[9px] font-bold text-stone-600 uppercase tracking-widest">Grey Trapping</span>
+                        </div>
+                      )}
                       {species.includes('marten') && (
                         <div className="flex items-center gap-2">
                           <div className="w-2 h-2 rounded-full bg-[#713f12]" />
@@ -1001,6 +1324,36 @@ export default function App() {
                 </div>
               </div>
 
+              {species.includes('grey_effort') && (
+                <div className="pt-2 mt-2 border-t border-stone-150 space-y-2">
+                  <p className="text-[8px] font-bold text-stone-400 uppercase tracking-tighter">Trapping Density (5km Grid)</p>
+                  <div className="space-y-1">
+                    <div className="flex items-center gap-2">
+                      <div className="w-5 h-2 bg-[#22c55e]/60 rounded-sm border border-[#16a34a]/30" />
+                      <span className="text-[8px] font-mono text-stone-500 font-bold uppercase tracking-tight">1 - 20% (Low)</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <div className="w-5 h-2 bg-[#84cc16]/60 rounded-sm border border-[#65a30d]/30" />
+                      <span className="text-[8px] font-mono text-stone-500 font-bold uppercase tracking-tight">21 - 40%</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <div className="w-5 h-2 bg-[#eab308]/60 rounded-sm border border-[#ca8a04]/30" />
+                      <span className="text-[8px] font-mono text-stone-500 font-bold uppercase tracking-tight">41 - 60% (Medium)</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <div className="w-5 h-2 bg-[#f97316]/60 rounded-sm border border-[#ea580c]/30" />
+                      <span className="text-[8px] font-mono text-stone-500 font-bold uppercase tracking-tight">61 - 80%</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <div className="w-5 h-2 bg-[#dc2626]/60 rounded-sm border border-[#b91c1c]/30" />
+                      <span className="text-[8px] font-mono text-stone-500 font-bold uppercase tracking-tight">81 - 100% (High)</span>
+                    </div>
+                  </div>
+                  <p className="text-[7.5px] text-stone-400 font-semibold italic leading-tight">
+                    *Auto-scaled to max {maxCount} records/square
+                  </p>
+                </div>
+              )}
 
               {isThinned && (
                 <div className="pt-2 mt-2 border-t border-amber-100 flex items-center gap-2">
