@@ -182,6 +182,35 @@ export default function App() {
   const [isSyncing, setIsSyncing] = useState(false);
   const [syncProgress, setSyncProgress] = useState<any>(null);
   const [syncStatusMap, setSyncStatusMap] = useState<Record<string, any>>({});
+  
+  const lastSyncDate = useMemo(() => {
+    const dates = Object.keys(syncStatusMap)
+      .map(key => syncStatusMap[key]?.lastSync)
+      .filter(Boolean);
+    
+    const targetDateStr = dates.reduce((latest, current) => {
+      if (!latest) return current;
+      return new Date(current) > new Date(latest) ? current : latest;
+    }, "") || new Date().toISOString();
+    
+    const date = new Date(targetDateStr);
+    const day = date.getDate();
+    const year = date.getFullYear();
+    
+    let daySuffix = 'th';
+    if (day === 1 || day === 21 || day === 31) daySuffix = 'st';
+    else if (day === 2 || day === 22) daySuffix = 'nd';
+    else if (day === 3 || day === 23) daySuffix = 'rd';
+    
+    const monthNames = [
+      "January", "February", "March", "April", "May", "June",
+      "July", "August", "September", "October", "November", "December"
+    ];
+    const month = monthNames[date.getMonth()];
+    
+    return `${day}${daySuffix} ${month} ${year}`;
+  }, [syncStatusMap]);
+
   const [mapBounds, setMapBounds] = useState<any>(null);
   const [mapZoom, setMapZoom] = useState(10);
   const [populationTimeline, setPopulationTimeline] = useState<any[]>([]);
@@ -687,7 +716,11 @@ export default function App() {
         <div className="flex items-center gap-3">
           <div>
             <h1 className="text-lg font-bold text-stone-900 leading-tight">Scottish Squirrel Explorer</h1>
-            <p className="text-[10px] text-stone-500 uppercase tracking-widest font-semibold italic">Central Borders Red Squirrel Network</p>
+            <p className="text-[10px] text-stone-500 uppercase tracking-widest font-semibold italic flex items-center gap-2">
+              <span>Central Borders Red Squirrel Network</span>
+              <span className="text-stone-300 font-normal">|</span>
+              <span className="text-stone-600 font-bold normal-case not-italic">Data current at {lastSyncDate}</span>
+            </p>
           </div>
         </div>
 
@@ -1184,6 +1217,16 @@ export default function App() {
 
         {/* Map Container */}
         <main className="flex-1 overflow-hidden relative">
+          {/* Map Floating Header / Data Date Badge */}
+          <div className="absolute top-6 left-6 z-[1000] pointer-events-none">
+            <div className="bg-white/95 backdrop-blur-md shadow-lg rounded-xl px-4 py-2 border border-stone-200/80 pointer-events-auto flex items-center gap-2">
+              <Calendar className="w-3.5 h-3.5 text-stone-500" />
+              <span className="text-xs font-bold text-stone-700 tracking-tight">
+                Data current at {lastSyncDate}
+              </span>
+            </div>
+          </div>
+
           {!loading && filteredSightings.length === 0 && mapBounds && debouncedBounds === mapBounds && (
             <div className="absolute inset-0 z-10 flex items-center justify-center bg-white/50 backdrop-blur-sm pointer-events-none">
               <div className="bg-white p-6 rounded-3xl shadow-2xl border border-red-100 text-center max-w-xs pointer-events-auto">

@@ -119,11 +119,17 @@ async function saveSpeciesToFile(species: 'red' | 'grey' | 'marten' | 'grey_trap
     await ensureDataDir();
     const filePath = getSpeciesFilePath(species);
     const dataToSave = bulkStore[species] || [];
-    await fs.writeFile(filePath, JSON.stringify(dataToSave, null, 2));
-    console.log(`[Persistence] Saved ${dataToSave.length} records to ${filePath}`);
+    const tsNow = syncStatus[species]?.lastSync || new Date().toISOString();
+    const wrapper = {
+      downloadedAt: tsNow,
+      records: dataToSave
+    };
+    await fs.writeFile(filePath, JSON.stringify(wrapper, null, 2));
+    console.log(`[Persistence] Saved ${dataToSave.length} records to ${filePath} with downloadedAt=${tsNow}`);
     
     // Save count to progress store to stay aligned
     syncProgressStore[species].count = dataToSave.length;
+    syncProgressStore[species].lastSync = tsNow;
     await saveProgressToFile();
   } catch (error) {
     console.error(`[Persistence] Error saving ${species} data:`, error);
@@ -155,7 +161,15 @@ async function ensureSpeciesLoaded(species: 'red' | 'grey' | 'marten' | 'grey_tr
       if (Array.isArray(parsed)) {
         bulkStore[species] = parsed;
         syncStatus[species].count = parsed.length;
-        console.log(`[Persistence] Loaded ${parsed.length} records for ${species} on-demand.`);
+        console.log(`[Persistence] Loaded raw array of ${parsed.length} records for ${species} on-demand.`);
+      } else if (parsed && typeof parsed === 'object' && Array.isArray(parsed.records)) {
+        bulkStore[species] = parsed.records;
+        syncStatus[species].count = parsed.records.length;
+        if (parsed.downloadedAt) {
+          syncStatus[species].lastSync = parsed.downloadedAt;
+          syncProgressStore[species].lastSync = parsed.downloadedAt;
+        }
+        console.log(`[Persistence] Loaded wrapped ${parsed.records.length} records for ${species} on-demand. downloadedAt=${parsed.downloadedAt}`);
       }
     }
   } catch (error) {
