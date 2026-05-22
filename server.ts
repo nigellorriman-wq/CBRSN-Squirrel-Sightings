@@ -25,12 +25,7 @@ function isPointInPolygon(lat: number, lon: number, polygon: [number, number][])
 // Initialize cache with 24 hour TTL
 const sightingsCache = new NodeCache({ stdTTL: 86400, checkperiod: 3600 });
 
-let DATA_DIR = path.join(process.cwd(), "data");
-if (existsSync(path.join(__dirname, "data"))) {
-  DATA_DIR = path.join(__dirname, "data");
-} else if (existsSync(path.join(__dirname, "../data"))) {
-  DATA_DIR = path.join(__dirname, "../data");
-}
+const DATA_DIR = path.join(process.cwd(), "data");
 
 const DATA_FILE = path.join(DATA_DIR, "squirrel_sightings.json");
 const PROGRESS_FILE = path.join(DATA_DIR, "sync_progress_v2.json");
@@ -49,7 +44,8 @@ let syncStatus: Record<string, {
   totalEstimated: number, 
   phase: string,
   currentYear?: number,
-  lastSync?: string
+  lastSync?: string,
+  isCancelled?: boolean
 }> = {
   red: { isLoading: false, count: 0, totalEstimated: 0, phase: 'idle' },
   grey: { isLoading: false, count: 0, totalEstimated: 0, phase: 'idle' },
@@ -419,6 +415,9 @@ async function fetchAllSightings(species: 'red' | 'grey' | 'marten' | 'grey_trap
 
     // Sync from year 2000 to current
     for (let year = currentYear; year >= 2000; year--) {
+      if (syncStatus[species]?.isCancelled) {
+        throw new Error("Cancelled by user");
+      }
       // If we are NOT on the current year, and a file for this year already exists in the data directory, we ignore/skip it!
       if (year < currentYear) {
         const yearFilePath = getSpeciesYearFilePath(species, year);
@@ -469,6 +468,9 @@ async function fetchAllSightings(species: 'red' | 'grey' | 'marten' | 'grey_trap
  
         for (const month of months) {
           if (yearHasError) break;
+          if (syncStatus[species]?.isCancelled) {
+            throw new Error("Cancelled by user");
+          }
           syncStatus[species].phase = `Downloading ${year}${month ? '-' + month : ''}`;
           
           let startOffset = 0;
@@ -478,6 +480,9 @@ async function fetchAllSightings(species: 'red' | 'grey' | 'marten' | 'grey_trap
           const periodFq = `${geoFq} AND ${statusFq} AND year:${year}${month ? ' AND month:' + month : ''}`;
  
           while (hasMoreInPeriod) {
+            if (syncStatus[species]?.isCancelled) {
+              throw new Error("Cancelled by user");
+            }
             try {
               const response = await axios.get(url, {
                 params: {
@@ -547,7 +552,7 @@ async function fetchAllSightings(species: 'red' | 'grey' | 'marten' | 'grey_trap
         
         // Inform user on UI about saving this year's file
         const savedFilename = `${species}_${year}.json`;
-        syncStatus[species].phase = `Saving ${savedFilename}`;
+        syncStatus[species].phase = `Creating JSON file: ${savedFilename}`;
         await new Promise(r => setTimeout(r, 600)); // Brief sleep so the UI registers this event
         
         await saveSpeciesYearToFile(species, year, yearRecords);
@@ -573,11 +578,17 @@ async function fetchAllSightings(species: 'red' | 'grey' | 'marten' | 'grey_trap
  
     await saveDataToFile(species);
     syncStatus[species].phase = 'Complete';
-  } catch (error) {
-    console.error(`[Bulk Load] Fatal error syncing ${species}:`, error);
-    syncStatus[species].phase = 'Error';
+  } catch (error: any) {
+    if (error && error.message === "Cancelled by user") {
+      console.log(`[Bulk Load] Sync for ${species} was cancelled by user.`);
+      syncStatus[species].phase = 'Cancelled';
+    } else {
+      console.error(`[Bulk Load] Fatal error syncing ${species}:`, error);
+      syncStatus[species].phase = 'Error';
+    }
   } finally {
     syncStatus[species].isLoading = false;
+    syncStatus[species].isCancelled = false;
   }
 }
 
@@ -728,12 +739,20 @@ async function processSyncQueue() {
 }
 
 function enqueueSync(species: 'red' | 'grey' | 'marten' | 'grey_trapping', forceReset: boolean = false) {
-  const alreadyInQueue = syncQueue.some(t => t.species === species);
-  const isCurrentlySyncing = syncStatus[species]?.isLoading;
-  
-  if (!alreadyInQueue && !isCurrentlySyncing) {
-    syncQueue.push({ species, forceReset });
-    console.log(`[Queue] Enqueued ${species} sync. Queue size: ${syncQueue.length}`);
+  if (forceReset) {
+    syncQueue = syncQueue.filter(t => t.species !== species);
+    syncQueue.unshift({ species, forceReset: true });
+    if (syncStatus[species]) {
+      syncStatus[species].isLoading = false;
+    }
+    console.log(`[Queue] Force-enqueued ${species} with forceReset=true (wiping any pending queue tasks and resetting isLoading lock).`);
+  } else {
+    const alreadyInQueue = syncQueue.some(t => t.species === species);
+    const isCurrentlySyncing = syncStatus[species]?.isLoading;
+    if (!alreadyInQueue && !isCurrentlySyncing) {
+      syncQueue.push({ species, forceReset: false });
+      console.log(`[Queue] Enqueued ${species} sync. Queue size: ${syncQueue.length}`);
+    }
   }
   processSyncQueue();
 }
@@ -1129,6 +1148,85 @@ async function startServer() {
       enqueueSync('marten', true);
       enqueueSync('grey_trapping', true);
       res.json({ message: `Sequential sync started for all four categories (red, grey, marten, grey_trapping)` });
+    }
+  });
+
+  app.post("/api/cancel-sync", async (req, res) => {
+    try {
+      console.log("[Cancel & Reset] Received cancellation and reset request");
+      
+      // 1. Clear queue
+      syncQueue = [];
+      
+      // 2. Set isCancelled flag on syncStatus for all species to abort active downloads
+      const speciesList: ('red' | 'grey' | 'marten' | 'grey_trapping')[] = ['red', 'grey', 'marten', 'grey_trapping'];
+      for (const s of speciesList) {
+        if (syncStatus[s]) {
+          syncStatus[s].isCancelled = true;
+          if (syncStatus[s].isLoading) {
+            syncStatus[s].phase = 'Cancelling...';
+          }
+        }
+      }
+
+      // 3. Briefly sleep to make sure active async tasks can read the cancellation flag and throw
+      await new Promise(r => setTimeout(r, 600));
+
+      const currentYear = new Date().getFullYear();
+
+      for (const s of speciesList) {
+        // Clear in-memory bulk store and reset status
+        bulkStore[s] = [];
+        syncStatus[s] = {
+          isLoading: false,
+          count: 0,
+          totalEstimated: 0,
+          phase: 'idle',
+          lastSync: undefined,
+          currentYear: undefined,
+          isCancelled: false
+        };
+
+        // Reset progress store for this species
+        syncProgressStore[s] = {
+          completedYears: [],
+          isComplete: false,
+          count: 0,
+          lastSync: undefined
+        };
+
+        // Delete all split year files
+        for (let y = 2000; y <= currentYear; y++) {
+          const yearFilePath = getSpeciesYearFilePath(s, y);
+          try {
+            if (existsSync(yearFilePath)) {
+              await fs.unlink(yearFilePath);
+              console.log(`[Cancel & Reset] Deleted: ${yearFilePath}`);
+            }
+          } catch (err) {}
+        }
+
+        // Delete legacy/master species file if any
+        const mainFilePath = getSpeciesFilePath(s);
+        try {
+          if (existsSync(mainFilePath)) {
+            await fs.unlink(mainFilePath);
+            console.log(`[Cancel & Reset] Deleted master file: ${mainFilePath}`);
+          }
+        } catch (err) {}
+      }
+
+      // Reset sightingsCache
+      sightingsCache.flushAll();
+
+      // Save the wiped progress store to file
+      await saveProgressToFile();
+      
+      console.log("[Cancel & Reset] Complete. All counters reset to 0, data deleted, and active syncs aborted.");
+      res.json({ success: true, message: "Sync successfully cancelled and all counters reset." });
+    } catch (err: any) {
+      console.error("[Cancel & Reset] Error:", err);
+      res.status(500).json({ error: err.message || "Failed to cancel and reset sync." });
     }
   });
 

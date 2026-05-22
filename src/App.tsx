@@ -2,7 +2,7 @@ import { useEffect, useState, useMemo, ChangeEvent } from 'react';
 import { MapContainer, TileLayer, CircleMarker, Tooltip, ZoomControl, useMapEvents, Polygon, Marker } from 'react-leaflet';
 import L from 'leaflet';
 import { motion, AnimatePresence } from 'motion/react';
-import { Filter, Calendar, Info, Layers, ChevronRight, ChevronLeft, MapPin, ZoomIn, Download, Upload, TrendingUp, BarChart3 } from 'lucide-react';
+import { Filter, Calendar, Info, Layers, ChevronRight, ChevronLeft, MapPin, ZoomIn, Download, Upload, TrendingUp, BarChart3, Trash2 } from 'lucide-react';
 import { Sighting } from './types';
 import { SQUIRREL_GROUPS } from './groups_data';
 import { 
@@ -640,6 +640,32 @@ export default function App() {
     }
   };
 
+  const cancelSync = async () => {
+    try {
+      const confirmReset = window.confirm("Are you sure you want to cancel the current sync and reset all sync counters to 0? This will wipe the downloaded NBN Atlas caches.");
+      if (!confirmReset) return;
+
+      setLoading(true);
+      const res = await fetch('/api/cancel-sync', { method: 'POST' });
+      if (res.ok) {
+        setIsSyncing(false);
+        setSightings([]);
+        
+        // Fetch fresh state immediately to update UI
+        const statusRes = await fetch('/api/sync-status');
+        if (statusRes.ok) {
+          const statusData = await statusRes.json();
+          setSyncStatusMap(statusData);
+          setSyncProgress(null);
+        }
+      }
+    } catch (err) {
+      console.error('Cancel sync error:', err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const handleDownload = async (type: 'json' | 'csv') => {
     try {
       const endpoint = type === 'json' ? '/api/export' : '/api/stats-csv';
@@ -1234,6 +1260,23 @@ export default function App() {
                       'SYNC WITH NBN ATLAS'
                     )}
                   </button>
+                  {isSyncing ? (
+                    <button 
+                      onClick={cancelSync}
+                      className="w-full py-3 bg-red-50 hover:bg-red-100 border border-red-200 text-red-700 rounded-xl text-xs font-bold transition-all active:scale-95 flex items-center justify-center gap-2 shadow-xs"
+                    >
+                      CANCEL & RESET COUNTERS
+                    </button>
+                  ) : (
+                    <button 
+                      type="button"
+                      onClick={cancelSync}
+                      className="w-full py-2 bg-transparent hover:bg-red-50 hover:text-red-700 text-stone-500 hover:border-red-100 border border-transparent rounded-xl text-[10px] font-semibold transition-all active:scale-95 flex items-center justify-center gap-1.5"
+                    >
+                      <Trash2 className="w-3 h-3" />
+                      WIPE PROGRESS & RESET COUNTERS
+                    </button>
+                  )}
                   <button 
                     onClick={() => handleDownload('json')}
                     className="w-full py-3 bg-stone-900 text-white rounded-xl text-xs font-bold shadow-sm hover:shadow-lg hover:bg-black transition-all active:scale-95 flex items-center justify-center gap-2"
